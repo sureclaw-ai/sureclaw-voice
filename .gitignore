@@ -1,0 +1,9 @@
+# Vendored deps and build scratch. Note: the plugin's compiled entry (dist/) and
+# the built web app (webapp/) ARE committed — they're the install artifacts.
+node_modules/
+app/node_modules/
+app/dist/
+app/.wrangler/
+*.tsbuildinfo
+*.bak
+.DS_Store

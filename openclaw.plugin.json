@@ -1,0 +1,41 @@
+{
+  "id": "sureclaw-voice",
+  "name": "SureClaw Voice",
+  "description": "Serves the browser voice web app and mints browser WebRTC realtime sessions from the configured realtime voice config.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "webrtc": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "iceServers": { "type": "array" },
+          "cloudflareTurn": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "keyId": { "type": "string" },
+              "apiToken": { "type": "string" },
+              "apiTokenEnv": { "type": "string" },
+              "ttlSeconds": { "type": "number" }
+            }
+          }
+        }
+      },
+      "webapp": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "path": { "type": "string" },
+          "dir": { "type": "string" }
+        }
+      }
+    }
+  }
+}

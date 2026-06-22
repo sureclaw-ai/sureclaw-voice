@@ -1,0 +1,4 @@
+node_modules/
+dist/
+openclaw-browser-voice-plugin/webapp/
+*.tsbuildinfo

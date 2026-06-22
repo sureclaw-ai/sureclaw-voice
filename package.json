@@ -1,0 +1,31 @@
+{
+  "name": "sureclaw-voice",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "SureClaw Voice — OpenClaw plugin that serves the browser voice PWA and mints browser WebRTC realtime sessions from the configured realtime voice config.",
+  "license": "UNLICENSED",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.27"
+    },
+    "install": {
+      "minHostVersion": ">=2026.5.27"
+    }
+  },
+  "scripts": {
+    "build": "npm run build:app && npm run build:plugin",
+    "build:app": "cd app && npm install && npm run build && rm -rf ../webapp && cp -R dist ../webapp",
+    "build:plugin": "esbuild index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "openclaw": "^2026.5.27",
+    "typescript": "^5.7.0"
+  }
+}
