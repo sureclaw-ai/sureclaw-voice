@@ -334,3 +334,94 @@ select:focus {
     align-items: center;
   }
 }
+
+/* ---------- Install banner ---------- */
+
+.installBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 9px 10px 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(4px);
+  animation: installSlideIn 0.35s ease both;
+}
+
+@keyframes installSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.installBanner__icon {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 7px;
+}
+
+.installBanner__text {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.installBanner__text strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Keep the inline platform glyphs riding on the text baseline. */
+.installBanner__glyph {
+  vertical-align: -2px;
+  color: var(--text);
+}
+
+.installBanner__action {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--green);
+  color: #04130d;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.installBanner__action:hover {
+  filter: brightness(1.06);
+}
+
+.installBanner__close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.installBanner__close:hover {
+  background: var(--bg-2);
+  color: var(--text);
+}
