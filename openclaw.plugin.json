@@ -33,7 +33,8 @@
         "properties": {
           "enabled": { "type": "boolean" },
           "path": { "type": "string" },
-          "dir": { "type": "string" }
+          "dir": { "type": "string" },
+          "name": { "type": "string", "description": "Display name shown in the page title, manifest, and the Call button. Default: OpenClaw." }
         }
       }
     }

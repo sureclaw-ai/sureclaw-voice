@@ -10,8 +10,28 @@ import { GatewayClient } from "./lib/gatewayClient";
 import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
 import { callSounds } from "./lib/callSounds";
 import { Visualizer } from "./Visualizer";
+import { InstallBanner } from "./InstallBanner";
+import { setCallActive } from "./callState";
 
 const STORAGE_KEY = "openclaw.voice.settings";
+
+// Read the configured assistant name from the <meta name="x-app-assistant-name">
+// tag, which the gateway rewrites from __APP_NAME__ at serve time. Falls back
+// to "OpenClaw" when unset (e.g. when the page is opened directly from the Vite
+// dev server without the gateway's token substitution).
+function readAssistantName(): string {
+  const raw = document
+    .querySelector('meta[name="x-app-assistant-name"]')
+    ?.getAttribute("content")
+    ?.trim();
+  // In the raw Vite dev server the gateway's token substitution hasn't run, so
+  // the content is still the literal "__APP_NAME__" placeholder — treat any
+  // unsubstituted __…__ token as unset and fall back to the default name.
+  if (!raw || /^__.*__$/.test(raw)) return "OpenClaw";
+  return raw;
+}
+
+const APP_NAME = readAssistantName();
 
 // Same-origin Gateway endpoint. When the app is served by the OpenClaw gateway
 // itself (e.g. https://host/voice behind cloudflared), the WebSocket goes back
@@ -216,6 +236,13 @@ export default function App() {
     status === "connecting" || status === "listening" || status === "thinking";
   const isError = status === "error";
 
+  // Keep the shared call-active flag in sync so the service-worker update
+  // flow in main.tsx can defer an incoming reload until the call ends.
+  useEffect(() => {
+    setCallActive(active);
+    return () => setCallActive(false);
+  }, [active]);
+
   // Hold a screen wake lock while a call is active so the phone does not
   // auto-lock and suspend the WebRTC mic — the most common avoidable way a
   // foreground call dies. The browser releases the lock whenever the page is
@@ -273,6 +300,8 @@ export default function App() {
 
   return (
     <main className="app">
+      <InstallBanner appName={APP_NAME} />
+
       <header className="bar">
         <span></span>
         <button
@@ -311,7 +340,7 @@ export default function App() {
           ) : (
             <button className="callButton call" onClick={startCall}>
               <Phone size={22} />
-              Call OpenClaw
+              Call {APP_NAME}
             </button>
           )}
         </div>

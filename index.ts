@@ -68,6 +68,9 @@ type WebappConfig = {
   // Absolute path to the built assets. Defaults to the `webapp/` directory
   // shipped next to this plugin (populated by `npm run build:webapp`).
   dir?: string;
+  // Display name shown in the page title, manifest, and the Call button.
+  // Defaults to "OpenClaw" (full name "OpenClaw Voice").
+  name?: string;
 };
 
 type PluginConfig = {
@@ -166,6 +169,7 @@ const entry = definePluginEntry({
           enabled: { type: "boolean" },
           path: { type: "string" },
           dir: { type: "string" },
+          name: { type: "string" },
         },
       },
     },
@@ -302,6 +306,22 @@ function registerWebappRoute(api: {
     return;
   }
 
+  // Resolve the display name. When `name` is configured it's used verbatim
+  // for the product title, manifest, and Call button (e.g. "Acme" →
+  // title "Acme", button "Call Acme"). When unset, defaults are:
+  //   - product (title/manifest name): "SureClaw Voice"
+  //   - home-screen label (short_name): "SureClaw Voice"
+  //   - assistant (Call button):        "OpenClaw"
+  const configuredName = webapp?.name?.trim();
+  const assistantName = (configuredName || "OpenClaw").slice(0, 60);
+  const productTitle = (configuredName || "SureClaw Voice").slice(0, 60);
+  const homeScreenLabel = (configuredName || "SureClaw Voice").slice(0, 60);
+  const tokens: Record<string, string> = {
+    __APP_NAME__: assistantName,
+    __APP_FULL_NAME__: productTitle,
+    __APP_SHORT_NAME__: homeScreenLabel,
+  };
+
   // Serve-only: the gateway authenticates the WebSocket itself (token or
   // trusted-proxy/Cloudflare Access). The page carries no credential.
   const mount = normalizeWebappMount(webapp?.path ?? DEFAULT_WEBAPP_MOUNT);
@@ -309,7 +329,7 @@ function registerWebappRoute(api: {
     path: mount,
     auth: "plugin",
     match: "prefix",
-    handler: (req, res) => serveWebappFile(req, res, mount, resolvePath(dir)),
+    handler: (req, res) => serveWebappFile(req, res, mount, resolvePath(dir), tokens),
   });
   api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
 }
@@ -341,6 +361,7 @@ async function serveWebappFile(
   res: ServerResponse,
   mount: string,
   root: string,
+  tokens: Record<string, string>,
 ): Promise<boolean> {
   const method = (req.method ?? "GET").toUpperCase();
   if (method !== "GET" && method !== "HEAD") return false;
@@ -381,6 +402,19 @@ async function serveWebappFile(
   }
 
   const contentType = WEBAPP_CONTENT_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
+  // Token substitution only on text payloads that need the configured name.
+  const isTokenized =
+    contentType.startsWith("text/") ||
+    contentType.startsWith("application/json") ||
+    contentType.startsWith("application/manifest+json") ||
+    contentType.startsWith("application/xhtml");
+  let body: Buffer;
+  if (isTokenized) {
+    const raw = await readFile(filePath, "utf8");
+    body = Buffer.from(replaceTokens(raw, tokens), "utf8");
+  } else {
+    body = await readFile(filePath);
+  }
   res.statusCode = 200;
   res.setHeader("Content-Type", contentType);
   // Cache hashed assets hard; keep the plain HTML shell / service worker fresh.
@@ -393,8 +427,19 @@ async function serveWebappFile(
     res.end();
     return true;
   }
-  res.end(await readFile(filePath));
+  res.end(body);
   return true;
+}
+
+// Replaces __APP_NAME__ / __APP_FULL_NAME__ tokens in the served HTML/manifest.
+// Only touches text payloads (see isTokenized), so binary assets are untouched.
+function replaceTokens(input: string, tokens: Record<string, string>): string {
+  if (!input.includes("__APP_")) return input;
+  let out = input;
+  for (const [key, value] of Object.entries(tokens)) {
+    out = out.split(key).join(value);
+  }
+  return out;
 }
 
 // Resolves the ICE (STUN/TURN) servers handed to the browser for this session.
