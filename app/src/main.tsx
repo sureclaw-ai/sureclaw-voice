@@ -11,21 +11,22 @@ import "./styles.css";
 // no-op in production, where the tokens are already real by the time JS runs.
 function normalizeUnsubstitutedTokens() {
   const PLACEHOLDER = /^__.*__$/;
+  const appToken = (name: "FULL_NAME" | "SHORT_NAME" | "NAME") => `__APP_${name}__`;
   // Mirror the gateway's own unconfigured defaults (see index.ts): the product
   // title and home-screen label fall back to "SureClaw Voice", while the
   // assistant name (Call button) falls back to "OpenClaw".
-  const FALLBACK: Record<string, string> = {
-    __APP_FULL_NAME__: "SureClaw Voice",
-    __APP_SHORT_NAME__: "SureClaw Voice",
-    __APP_NAME__: "OpenClaw",
-  };
+  const FALLBACK = new Map<string, string>([
+    [appToken("FULL_NAME"), "SureClaw Voice"],
+    [appToken("SHORT_NAME"), "SureClaw Voice"],
+    [appToken("NAME"), "OpenClaw"],
+  ]);
   if (PLACEHOLDER.test(document.title)) {
-    document.title = FALLBACK[document.title] ?? "SureClaw Voice";
+    document.title = FALLBACK.get(document.title) ?? "SureClaw Voice";
   }
   for (const meta of document.querySelectorAll("meta[content]")) {
     const content = meta.getAttribute("content")?.trim() ?? "";
     if (PLACEHOLDER.test(content)) {
-      meta.setAttribute("content", FALLBACK[content] ?? "SureClaw Voice");
+      meta.setAttribute("content", FALLBACK.get(content) ?? "SureClaw Voice");
     }
   }
 }
