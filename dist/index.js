@@ -157,6 +157,7 @@ const WEBAPP_CONTENT_TYPES = {
 	".map": "application/json; charset=utf-8",
 	".txt": "text/plain; charset=utf-8"
 };
+const TOKENIZED_EXTENSIONS = /* @__PURE__ */ new Set([".html", ".webmanifest"]);
 function registerWebappRoute(api) {
 	const webapp = api.pluginConfig?.webapp;
 	if (webapp?.enabled === false) return;
@@ -202,7 +203,7 @@ async function serveWebappFile(req, res, mount, root, tokens) {
 	const url = new URL(req.url ?? "/", "http://localhost");
 	const pathname = decodeURIComponent(url.pathname);
 	if (pathname === mount) {
-		res.statusCode = 301;
+		res.statusCode = 307;
 		res.setHeader("Location", `${mount}/${url.search}`);
 		res.end();
 		return true;
@@ -224,8 +225,9 @@ async function serveWebappFile(req, res, mount, root, tokens) {
 		}
 		filePath = resolve(root, "index.html");
 	}
-	const contentType = WEBAPP_CONTENT_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
-	const isTokenized = contentType.startsWith("text/") || contentType.startsWith("application/json") || contentType.startsWith("application/manifest+json") || contentType.startsWith("application/xhtml");
+	const ext = extname(filePath).toLowerCase();
+	const contentType = WEBAPP_CONTENT_TYPES[ext] ?? "application/octet-stream";
+	const isTokenized = TOKENIZED_EXTENSIONS.has(ext);
 	let body;
 	if (isTokenized) {
 		const raw = await readFile(filePath, "utf8");

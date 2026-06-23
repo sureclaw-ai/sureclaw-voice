@@ -280,6 +280,12 @@ const WEBAPP_CONTENT_TYPES: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+// File extensions whose payloads carry __APP_*__ display-name tokens and must be
+// rewritten at serve time: the HTML shell (title + iOS/PWA metas) and the web
+// manifest (name/short_name). Deliberately excludes .js/.css — see the note in
+// serveWebappFile on why tokenizing the JS bundle corrupts it.
+const TOKENIZED_EXTENSIONS = new Set([".html", ".webmanifest"]);
+
 // Serves the built voice PWA (Vite `dist/`) from the gateway's own HTTP server
 // so a single origin handles both the HTTPS page and the operator WebSocket.
 // Fails soft: if the assets are absent the route is simply not registered.
@@ -371,8 +377,11 @@ async function serveWebappFile(
 
   // Redirect the bare mount to a trailing slash so the relative asset URLs in
   // index.html resolve under the mount (…/voice/assets/… not /assets/…).
+  // Use 307 (temporary), never 301: a permanent redirect is cached by browsers
+  // indefinitely, so a stale mount target can poison clients long after the
+  // server is fixed (e.g. an old /voice → / redirect surviving a remount).
   if (pathname === mount) {
-    res.statusCode = 301;
+    res.statusCode = 307;
     res.setHeader("Location", `${mount}/${url.search}`);
     res.end();
     return true;
@@ -401,13 +410,16 @@ async function serveWebappFile(
     filePath = resolvePath(root, "index.html");
   }
 
-  const contentType = WEBAPP_CONTENT_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
-  // Token substitution only on text payloads that need the configured name.
-  const isTokenized =
-    contentType.startsWith("text/") ||
-    contentType.startsWith("application/json") ||
-    contentType.startsWith("application/manifest+json") ||
-    contentType.startsWith("application/xhtml");
+  const ext = extname(filePath).toLowerCase();
+  const contentType = WEBAPP_CONTENT_TYPES[ext] ?? "application/octet-stream";
+  // Token substitution runs ONLY on the files that carry __APP_*__ tokens: the
+  // HTML shell and the web manifest. It must never touch the JS bundle — that
+  // bundle legitimately contains the literal tokens as object keys (main.tsx's
+  // unsubstituted-token fallback map), and rewriting them with a multi-word
+  // display name produces invalid JS (e.g. `{SureClaw Voice: …}`), which fails
+  // to parse so the app never mounts. A content-type heuristic gets this wrong
+  // because `.js` is served as text/javascript; key on the extension instead.
+  const isTokenized = TOKENIZED_EXTENSIONS.has(ext);
   let body: Buffer;
   if (isTokenized) {
     const raw = await readFile(filePath, "utf8");
