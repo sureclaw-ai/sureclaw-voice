@@ -1,12 +1,17 @@
 {
-  "name": "OpenClaw Voice",
-  "short_name": "OpenClaw",
-  "description": "Call OpenClaw from the browser with WebRTC.",
+  "id": "/",
+  "name": "__APP_FULL_NAME__",
+  "short_name": "__APP_SHORT_NAME__",
+  "description": "Call __APP_NAME__ from the browser with WebRTC.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
   "background_color": "#101418",
   "theme_color": "#101418",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["productivity", "utilities", "communication"],
   "icons": [
     {
       "src": "./icon.svg",
@@ -15,9 +20,15 @@
       "purpose": "any"
     },
     {
-      "src": "./icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
+      "src": "./icons/manifest-icon-192.maskable.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "./icons/manifest-icon-512.maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
       "purpose": "maskable"
     }
   ]
