@@ -27,8 +27,7 @@ function detectPlatform(): MobilePlatform | null {
   // iPadOS 13+ masquerades as desktop Safari, so also treat a touch-capable
   // "Macintosh" as iOS.
   const isIOS =
-    /iphone|ipad|ipod/i.test(ua) ||
-    (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+    /iphone|ipad|ipod/i.test(ua) || (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
   if (isIOS) return "ios";
   if (/android/i.test(ua)) return "android";
   return null;
@@ -40,8 +39,7 @@ function isStandalone(): boolean {
     window.matchMedia?.("(display-mode: standalone)").matches === true ||
     // iOS Safari exposes this non-standard flag when launched from the home
     // screen.
-    (window.navigator as Navigator & { standalone?: boolean }).standalone ===
-      true
+    (window.navigator as Navigator & { standalone?: boolean }).standalone === true
   );
 }
 
@@ -57,8 +55,7 @@ export function InstallBanner({ appName }: { appName: string }) {
   const [platform] = useState(detectPlatform);
   const [dismissed, setDismissed] = useState(wasDismissed);
   const [standalone, setStandalone] = useState(isStandalone);
-  const [deferredPrompt, setDeferredPrompt] =
-    useState<BeforeInstallPromptEvent | null>(null);
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
 
   // Capture Android/Chrome's install prompt so our own button can trigger it,
   // and hide the banner the moment the app gets installed.
@@ -107,27 +104,18 @@ export function InstallBanner({ appName }: { appName: string }) {
         ) : platform === "ios" ? (
           <>
             Install {appName}: tap{" "}
-            <Share size={15} className="installBanner__glyph" aria-label="Share" />{" "}
-            then <strong>Add to Home Screen</strong>{" "}
-            <SquarePlus
-              size={15}
-              className="installBanner__glyph"
-              aria-hidden
-            />
+            <Share size={15} className="installBanner__glyph" aria-label="Share" /> then{" "}
+            <strong>Add to Home Screen</strong>{" "}
+            <SquarePlus size={15} className="installBanner__glyph" aria-hidden />
           </>
         ) : (
           <>
-            Install {appName}: open the browser menu, then{" "}
-            <strong>Add to Home screen</strong>.
+            Install {appName}: open the browser menu, then <strong>Add to Home screen</strong>.
           </>
         )}
       </p>
       {platform === "android" && deferredPrompt && (
-        <button
-          className="installBanner__action"
-          onClick={install}
-          type="button"
-        >
+        <button className="installBanner__action" onClick={install} type="button">
           <Plus size={15} />
           Install
         </button>

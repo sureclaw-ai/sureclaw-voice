@@ -34,7 +34,10 @@ export class GatewayClient {
 
         if (frame.type === "event") {
           if (frame.event === "connect.challenge") {
-            this.request("connect", this.buildConnectParams(frame.payload), 15000).then(resolve, reject);
+            this.request("connect", this.buildConnectParams(frame.payload), 15000).then(
+              resolve,
+              reject,
+            );
             return;
           }
           this.listeners.forEach((listener) => listener(frame));
@@ -47,14 +50,18 @@ export class GatewayClient {
           window.clearTimeout(pending.timeout);
           this.pending.delete(frame.id);
           if (frame.ok) pending.resolve(frame.payload);
-          else pending.reject(new Error(frame.error?.message || frame.error?.code || "Gateway request failed"));
+          else
+            pending.reject(
+              new Error(frame.error?.message || frame.error?.code || "Gateway request failed"),
+            );
         }
       });
 
       ws.addEventListener("error", () => reject(new Error("Gateway WebSocket failed")));
       ws.addEventListener("close", (event) => {
         this.flushPending(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
-        if (!event.wasClean && this.helloPromise) reject(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
+        if (!event.wasClean && this.helloPromise)
+          reject(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
       });
     });
     return this.helloPromise;

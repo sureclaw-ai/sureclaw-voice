@@ -76,7 +76,9 @@ export class OpenAIRealtimeCall {
     }
 
     this.closed = false;
-    const iceServers = this.session.iceServers?.length ? this.session.iceServers : DEFAULT_ICE_SERVERS;
+    const iceServers = this.session.iceServers?.length
+      ? this.session.iceServers
+      : DEFAULT_ICE_SERVERS;
     this.callbacks.onLog(
       `WebRTC ICE servers: ${iceServers.map((server) => JSON.stringify(server.urls)).join(", ")}`,
     );
@@ -122,7 +124,9 @@ export class OpenAIRealtimeCall {
     const responseText = await response.text();
     if (!response.ok) {
       const detail = formatHttpErrorDetail(responseText);
-      throw new Error(`Realtime WebRTC setup failed (${response.status})${detail ? `: ${detail}` : ""}`);
+      throw new Error(
+        `Realtime WebRTC setup failed (${response.status})${detail ? `: ${detail}` : ""}`,
+      );
     }
     await this.peer.setRemoteDescription({ type: "answer", sdp: responseText });
   }
@@ -208,7 +212,10 @@ export class OpenAIRealtimeCall {
       console.debug(`${LOG_PREFIX} → send ${type}`, event);
       this.channel.send(JSON.stringify(event));
     } else {
-      console.warn(`${LOG_PREFIX} → send DROPPED ${type} (data channel: ${this.channel?.readyState ?? "none"})`, event);
+      console.warn(
+        `${LOG_PREFIX} → send DROPPED ${type} (data channel: ${this.channel?.readyState ?? "none"})`,
+        event,
+      );
     }
   }
 
@@ -323,7 +330,9 @@ export class OpenAIRealtimeCall {
       const result = await this.runOpenClawConsult(callId, args, controller.signal);
       this.submitToolResult(callId, { result });
     } catch (error) {
-      this.submitToolResult(callId, { error: error instanceof Error ? error.message : String(error) });
+      this.submitToolResult(callId, {
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       this.abortControllers.delete(controller);
       this.toolCallsInFlight -= 1;
@@ -338,7 +347,18 @@ export class OpenAIRealtimeCall {
     // we resume.
     this.send({
       type: "session.update",
-      session: { type: "realtime", audio: { input: { turn_detection: { type: "server_vad", create_response: false, interrupt_response: false } } } },
+      session: {
+        type: "realtime",
+        audio: {
+          input: {
+            turn_detection: {
+              type: "server_vad",
+              create_response: false,
+              interrupt_response: false,
+            },
+          },
+        },
+      },
     });
     this.send({ type: "input_audio_buffer.clear" });
     this.callbacks.onLog("Suspended auto turn-taking for OpenClaw tool call");
@@ -348,20 +368,36 @@ export class OpenAIRealtimeCall {
     if (!this.turnDetectionSuspended) return;
     // Only restore once no tool calls remain pending and the post-tool answer
     // has fully completed, so the answer itself is never interrupted.
-    if (this.toolCallsInFlight > 0 || this.responseActive || this.responseCreateInFlight || this.responseCreatePending) {
+    if (
+      this.toolCallsInFlight > 0 ||
+      this.responseActive ||
+      this.responseCreateInFlight ||
+      this.responseCreatePending
+    ) {
       return;
     }
     this.turnDetectionSuspended = false;
     this.send({
       type: "session.update",
-      session: { type: "realtime", audio: { input: { turn_detection: { type: "server_vad", create_response: true, interrupt_response: true } } } },
+      session: {
+        type: "realtime",
+        audio: {
+          input: {
+            turn_detection: { type: "server_vad", create_response: true, interrupt_response: true },
+          },
+        },
+      },
     });
     this.callbacks.onLog("Resumed auto turn-taking");
   }
 
   private async runOpenClawConsult(callId: string, rawArgs: string, signal: AbortSignal) {
     const args = safeJson(rawArgs);
-    console.debug(`${LOG_PREFIX} consult → gateway talk.client.toolCall`, { sessionKey: this.sessionKey, callId, args });
+    console.debug(`${LOG_PREFIX} consult → gateway talk.client.toolCall`, {
+      sessionKey: this.sessionKey,
+      callId,
+      args,
+    });
     const response = (await this.gateway.request("talk.client.toolCall", {
       sessionKey: this.sessionKey,
       callId,
@@ -379,23 +415,36 @@ export class OpenAIRealtimeCall {
   private waitForChatFinal(runId: string, signal: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
       const timeout = window.setTimeout(() => {
-        console.warn(`${LOG_PREFIX} consult TIMEOUT after 120s (runId=${runId}) — no chat 'final' event arrived`);
+        console.warn(
+          `${LOG_PREFIX} consult TIMEOUT after 120s (runId=${runId}) — no chat 'final' event arrived`,
+        );
         cleanup(() => reject(new Error("OpenClaw consult timed out")));
       }, 120000);
-      const abort = () => cleanup(() => reject(new DOMException("OpenClaw consult aborted", "AbortError")));
+      const abort = () =>
+        cleanup(() => reject(new DOMException("OpenClaw consult aborted", "AbortError")));
       const unsubscribe = this.gateway.addEventListener((event: GatewayEvent) => {
         if (event.event !== "chat") return;
         const payload = event.payload;
         if (!payload || typeof payload !== "object") return;
-        const chat = payload as { runId?: string; state?: string; message?: string; errorMessage?: string };
+        const chat = payload as {
+          runId?: string;
+          state?: string;
+          message?: string;
+          errorMessage?: string;
+        };
         console.debug(
           `${LOG_PREFIX} consult chat event: runId=${chat.runId} state=${chat.state}${chat.runId === runId ? " (MATCH)" : " (waiting for " + runId + ")"}`,
           payload,
         );
         if (chat.runId !== runId) return;
-        if (chat.state === "final") cleanup(() => resolve(chat.message?.trim() || "OpenClaw finished with no text."));
-        if (chat.state === "aborted") cleanup(() => reject(new DOMException(chat.errorMessage || "OpenClaw aborted", "AbortError")));
-        if (chat.state === "error") cleanup(() => reject(new Error(chat.errorMessage || "OpenClaw failed")));
+        if (chat.state === "final")
+          cleanup(() => resolve(chat.message?.trim() || "OpenClaw finished with no text."));
+        if (chat.state === "aborted")
+          cleanup(() =>
+            reject(new DOMException(chat.errorMessage || "OpenClaw aborted", "AbortError")),
+          );
+        if (chat.state === "error")
+          cleanup(() => reject(new Error(chat.errorMessage || "OpenClaw failed")));
       });
 
       signal.addEventListener("abort", abort, { once: true });
@@ -440,7 +489,12 @@ export class OpenAIRealtimeCall {
   private extractErrorDetail(error: unknown) {
     if (!error || typeof error !== "object") return "Realtime provider error";
     const record = error as Record<string, unknown>;
-    return stringField(record, "message") || stringField(record, "code") || stringField(record, "type") || "Realtime provider error";
+    return (
+      stringField(record, "message") ||
+      stringField(record, "code") ||
+      stringField(record, "type") ||
+      "Realtime provider error"
+    );
   }
 }
 
@@ -472,7 +526,9 @@ function formatHttpErrorDetail(body: string) {
   if (!trimmed) return "";
   const redacted = trimmed.replace(/(Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/giu, "$1 [redacted]");
   try {
-    const parsed = JSON.parse(redacted) as { error?: { message?: unknown; code?: unknown; type?: unknown } };
+    const parsed = JSON.parse(redacted) as {
+      error?: { message?: unknown; code?: unknown; type?: unknown };
+    };
     const error = parsed.error;
     const parts = [
       typeof error?.message === "string" ? error.message : "",

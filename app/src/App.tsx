@@ -1,11 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Phone, PhoneOff, RotateCcw, Settings, X } from "lucide-react";
-import type {
-  CallStatus,
-  GatewaySettings,
-  RealtimeBrowserSession,
-  TranscriptEntry,
-} from "./types";
+import type { CallStatus, GatewaySettings, RealtimeBrowserSession, TranscriptEntry } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
 import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
 import { callSounds } from "./lib/callSounds";
@@ -65,9 +60,7 @@ function loadSettings(): GatewaySettings {
 }
 
 export default function App() {
-  const [settings, setSettings] = useState<GatewaySettings>(() =>
-    loadSettings(),
-  );
+  const [settings, setSettings] = useState<GatewaySettings>(() => loadSettings());
   const [saved, setSaved] = useState(false);
   // The gateway authenticates the WebSocket itself (token or trusted-proxy /
   // Cloudflare Access), so the app needs no credential to start — don't force
@@ -77,9 +70,9 @@ export default function App() {
   const [status, setStatus] = useState<CallStatus>("idle");
   const [detail, setDetail] = useState<string>("");
   const [errorTitle, setErrorTitle] = useState<string>("Call interrupted");
-  const [streams, setStreams] = useState<
-    Array<{ kind: "mic" | "remote"; stream: MediaStream }>
-  >([]);
+  const [streams, setStreams] = useState<Array<{ kind: "mic" | "remote"; stream: MediaStream }>>(
+    [],
+  );
   const gatewayRef = useRef<GatewayClient | null>(null);
   const callRef = useRef<OpenAIRealtimeCall | null>(null);
   // Whether the user currently intends to be in a call. Guards against a late
@@ -116,9 +109,7 @@ export default function App() {
 
   function addStream(kind: "mic" | "remote", stream: MediaStream) {
     setStreams((current) =>
-      current.some((s) => s.stream === stream)
-        ? current
-        : [...current, { kind, stream }],
+      current.some((s) => s.stream === stream) ? current : [...current, { kind, stream }],
     );
   }
 
@@ -174,9 +165,7 @@ export default function App() {
     );
 
     if (voiceSession.transport !== "webrtc") {
-      throw new Error(
-        `Gateway returned unsupported transport: ${voiceSession.transport}`,
-      );
+      throw new Error(`Gateway returned unsupported transport: ${voiceSession.transport}`);
     }
 
     const call = new OpenAIRealtimeCall(gateway, sessionKey, voiceSession, {
@@ -232,8 +221,7 @@ export default function App() {
     setDetail("");
   }
 
-  const active =
-    status === "connecting" || status === "listening" || status === "thinking";
+  const active = status === "connecting" || status === "listening" || status === "thinking";
   const isError = status === "error";
 
   // Keep the shared call-active flag in sync so the service-worker update
@@ -255,8 +243,7 @@ export default function App() {
     async function acquireWakeLock() {
       if (cancelled || document.visibilityState !== "visible") return;
       try {
-        wakeLockRef.current =
-          (await navigator.wakeLock?.request("screen")) ?? null;
+        wakeLockRef.current = (await navigator.wakeLock?.request("screen")) ?? null;
       } catch {
         // Denied (e.g. low-power mode). The call still runs while foreground.
       }
@@ -284,10 +271,7 @@ export default function App() {
     if (status !== prev) {
       if (status === "connecting") {
         callSounds.startRinging();
-      } else if (
-        (status === "listening" || status === "thinking") &&
-        prev === "connecting"
-      ) {
+      } else if ((status === "listening" || status === "thinking") && prev === "connecting") {
         callSounds.connected();
       } else if (status === "error") {
         callSounds.error();
@@ -347,14 +331,8 @@ export default function App() {
       </section>
 
       {showSettings && (
-        <div
-          className="sheetBackdrop"
-          onClick={() => settings.secret && setShowSettings(false)}
-        >
-          <section
-            className="sheet"
-            onClick={(event) => event.stopPropagation()}
-          >
+        <div className="sheetBackdrop" onClick={() => settings.secret && setShowSettings(false)}>
+          <section className="sheet" onClick={(event) => event.stopPropagation()}>
             <div className="sheetHead">
               <h2>Settings</h2>
               {settings.secret && (
@@ -372,9 +350,7 @@ export default function App() {
                 <span>Gateway URL</span>
                 <input
                   value={settings.gatewayUrl}
-                  onChange={(event) =>
-                    updateSettings({ gatewayUrl: event.target.value })
-                  }
+                  onChange={(event) => updateSettings({ gatewayUrl: event.target.value })}
                 />
               </label>
               <div className="split">
@@ -397,9 +373,7 @@ export default function App() {
                   <input
                     type="password"
                     value={settings.secret}
-                    onChange={(event) =>
-                      updateSettings({ secret: event.target.value })
-                    }
+                    onChange={(event) => updateSettings({ secret: event.target.value })}
                     autoComplete="current-password"
                   />
                 </label>
@@ -409,9 +383,7 @@ export default function App() {
                 <input
                   placeholder="Auto from agents.list"
                   value={settings.sessionKey}
-                  onChange={(event) =>
-                    updateSettings({ sessionKey: event.target.value })
-                  }
+                  onChange={(event) => updateSettings({ sessionKey: event.target.value })}
                 />
               </label>
               <button className="saveButton" type="submit">

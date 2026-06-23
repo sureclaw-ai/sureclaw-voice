@@ -32,8 +32,7 @@ class CallSounds {
     if (typeof window === "undefined") return null;
     const Ctor =
       window.AudioContext ??
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctor) return null;
     if (!this.ctx) {
       this.ctx = new Ctor();
@@ -57,10 +56,7 @@ class CallSounds {
     freq: Note,
     at: number,
     duration: number,
-    {
-      type = "sine",
-      gain = 1,
-    }: { type?: OscillatorType; gain?: number } = {},
+    { type = "sine", gain = 1 }: { type?: OscillatorType; gain?: number } = {},
   ) {
     const a = this.audio();
     if (!a) return;
