@@ -7,3 +7,8 @@ app/.wrangler/
 *.tsbuildinfo
 *.bak
 .DS_Store
+
+# npm lockfiles are not used; pnpm-lock.yaml is committed at the repo root.
+package-lock.json
+app/package-lock.json
+yarn.lock

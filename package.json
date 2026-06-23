@@ -19,13 +19,13 @@
     }
   },
   "scripts": {
-    "build": "npm run build:app && npm run build:plugin",
-    "build:app": "cd app && npm install && npm run build && rm -rf ../webapp && cp -R dist ../webapp",
-    "build:plugin": "esbuild index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js"
+    "build": "pnpm run build:app && pnpm run build:plugin",
+    "build:app": "pnpm --filter openclaw-voice-pwa build && rm -rf webapp && cp -R app/dist webapp",
+    "build:plugin": "rolldown --config rolldown.config.ts"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
     "openclaw": "^2026.5.27",
-    "typescript": "^5.7.0"
+    "rolldown": "^1.1.2",
+    "typescript": "^6.0.3"
   }
 }

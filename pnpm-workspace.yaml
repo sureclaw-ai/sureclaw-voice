@@ -1,0 +1,10 @@
+packages:
+  - app
+allowBuilds:
+  '@google/genai': false
+  esbuild: true
+  openclaw: true
+  protobufjs: true
+  sharp: true
+  tree-sitter-bash: true
+  workerd: true
