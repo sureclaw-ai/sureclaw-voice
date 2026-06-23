@@ -291,6 +291,9 @@ const TOKENIZED_EXTENSIONS = new Set([".html", ".webmanifest"]);
 // Fails soft: if the assets are absent the route is simply not registered.
 function registerWebappRoute(api: {
   pluginConfig?: PluginConfig;
+  // The gateway's own auth config. The app reads the mode (via the injected
+  // meta tag below) to decide whether to expose its Settings sheet at all.
+  config?: { gateway?: { auth?: { mode?: string } } };
   logger?: { info?: (m: string) => void; warn?: (m: string) => void };
   registerHttpRoute: (params: {
     path: string;
@@ -322,10 +325,17 @@ function registerWebappRoute(api: {
   const assistantName = (configuredName || "OpenClaw").slice(0, 60);
   const productTitle = (configuredName || "SureClaw Voice").slice(0, 60);
   const homeScreenLabel = (configuredName || "SureClaw Voice").slice(0, 60);
+  // The gateway authenticates the WebSocket itself; the app only needs a
+  // credential in token/password mode. In trusted-proxy mode (Cloudflare
+  // Access et al.) there is nothing for the user to configure, so the app
+  // hides its Settings sheet entirely. Default to "token" when unset — that
+  // is the gateway's own default for an unconfigured auth mode.
+  const gatewayAuthMode = api.config?.gateway?.auth?.mode ?? "token";
   const tokens: Record<string, string> = {
     __APP_NAME__: assistantName,
     __APP_FULL_NAME__: productTitle,
     __APP_SHORT_NAME__: homeScreenLabel,
+    __APP_GATEWAY_AUTH__: gatewayAuthMode,
   };
 
   // Serve-only: the gateway authenticates the WebSocket itself (token or
