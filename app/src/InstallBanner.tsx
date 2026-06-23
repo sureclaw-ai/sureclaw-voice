@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Share, SquarePlus, X } from "lucide-react";
+import { ChevronDown, Plus, Share, SquarePlus, X } from "lucide-react";
 
 // A slim, top-of-screen hint that nudges mobile users to install the PWA to
 // their home screen. It only appears when ALL of these hold:
@@ -8,8 +8,8 @@ import { Plus, Share, SquarePlus, X } from "lucide-react";
 //   - the user hasn't dismissed it before (persisted in localStorage).
 // The install flow differs per platform, so the copy + icons adapt: Android
 // fires `beforeinstallprompt` and we can drive the native installer directly;
-// iOS Safari has no such event, so we show the Share → "Add to Home Screen"
-// steps with the matching glyphs.
+// iOS Safari has no such event, so the banner opens a full-screen, step-by-step
+// guide (the Share → "Add to Home Screen" flow) aimed at non-technical users.
 
 const DISMISS_KEY = "openclaw.voice.installBannerDismissed";
 
@@ -57,6 +57,7 @@ export function InstallBanner({ appName }: { appName: string }) {
   const [dismissed, setDismissed] = useState(wasDismissed);
   const [standalone, setStandalone] = useState(isStandalone);
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [guideOpen, setGuideOpen] = useState(false);
 
   // Capture Android/Chrome's install prompt so our own button can trigger it,
   // and hide the banner the moment the app gets installed.
@@ -76,6 +77,16 @@ export function InstallBanner({ appName }: { appName: string }) {
     };
   }, []);
 
+  // Lock background scrolling while the full-screen iOS guide is open.
+  useEffect(() => {
+    if (!guideOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [guideOpen]);
+
   if (!PLATFORM || standalone || dismissed) return null;
 
   function dismiss() {
@@ -84,6 +95,7 @@ export function InstallBanner({ appName }: { appName: string }) {
     } catch {
       // Best-effort; if storage is unavailable the banner just returns next load.
     }
+    setGuideOpen(false);
     setDismissed(true);
   }
 
@@ -97,38 +109,117 @@ export function InstallBanner({ appName }: { appName: string }) {
   }
 
   return (
-    <section className="installBanner" aria-label="Install app">
-      <img className="installBanner__icon" src="./icon.svg" alt="" aria-hidden />
-      <p className="installBanner__text">
-        {PLATFORM === "android" && deferredPrompt ? (
-          <>Install {appName} for a full-screen, app-like experience.</>
-        ) : PLATFORM === "ios" ? (
-          <>
-            Install {appName}: tap{" "}
-            <Share size={15} className="installBanner__glyph" aria-label="Share" /> then{" "}
-            <strong>Add to Home Screen</strong>{" "}
-            <SquarePlus size={15} className="installBanner__glyph" aria-hidden />
-          </>
-        ) : (
-          <>
-            Install {appName}: open the browser menu, then <strong>Add to Home screen</strong>.
-          </>
+    <>
+      <section className="installBanner" aria-label="Install app">
+        <img className="installBanner__icon" src="./icon.svg" alt="" aria-hidden />
+        <p className="installBanner__text">
+          {PLATFORM === "android" && deferredPrompt ? (
+            <>Install {appName} for a full-screen, app-like experience.</>
+          ) : PLATFORM === "ios" ? (
+            <>
+              Add {appName} to your Home Screen for one-tap access.
+            </>
+          ) : (
+            <>
+              Install {appName}: open the browser menu, then <strong>Add to Home screen</strong>.
+            </>
+          )}
+        </p>
+        {PLATFORM === "android" && deferredPrompt && (
+          <button className="installBanner__action" onClick={install} type="button">
+            <Plus size={15} />
+            Install
+          </button>
         )}
-      </p>
-      {PLATFORM === "android" && deferredPrompt && (
-        <button className="installBanner__action" onClick={install} type="button">
-          <Plus size={15} />
-          Install
+        {PLATFORM === "ios" && (
+          <button
+            className="installBanner__action"
+            onClick={() => setGuideOpen(true)}
+            type="button"
+          >
+            Show me how
+          </button>
+        )}
+        <button
+          className="installBanner__close"
+          onClick={dismiss}
+          aria-label="Dismiss install hint"
+          type="button"
+        >
+          <X size={16} />
         </button>
+      </section>
+
+      {guideOpen && PLATFORM === "ios" && (
+        <div
+          className="installGuide"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Install ${appName}`}
+        >
+          <div className="installGuide__card">
+            <button
+              className="installGuide__close"
+              onClick={() => setGuideOpen(false)}
+              aria-label="Close"
+              type="button"
+            >
+              <X size={20} />
+            </button>
+
+            <img className="installGuide__icon" src="./icon.svg" alt="" aria-hidden />
+            <h2 className="installGuide__title">Install {appName}</h2>
+            <p className="installGuide__lead">
+              Add it to your Home Screen so it opens full-screen, just like a normal app. It only
+              takes a few seconds.
+            </p>
+
+            <ol className="installGuide__steps">
+              <li className="installGuide__step">
+                <span className="installGuide__num">1</span>
+                <span className="installGuide__stepText">
+                  Tap the <strong>Share</strong> button
+                  <span className="installGuide__stepHint">
+                    It looks like this, at the bottom of the screen.
+                  </span>
+                </span>
+                <span className="installGuide__stepIcon" aria-hidden>
+                  <Share size={22} />
+                </span>
+              </li>
+              <li className="installGuide__step">
+                <span className="installGuide__num">2</span>
+                <span className="installGuide__stepText">
+                  Scroll down and tap <strong>Add to Home Screen</strong>
+                </span>
+                <span className="installGuide__stepIcon" aria-hidden>
+                  <SquarePlus size={22} />
+                </span>
+              </li>
+              <li className="installGuide__step">
+                <span className="installGuide__num">3</span>
+                <span className="installGuide__stepText">
+                  Tap <strong>Add</strong> in the top-right corner — done!
+                </span>
+              </li>
+            </ol>
+
+            <button
+              className="installGuide__done"
+              onClick={() => setGuideOpen(false)}
+              type="button"
+            >
+              Got it
+            </button>
+          </div>
+
+          {/* Points non-technical users at Safari's Share button in the bottom bar. */}
+          <div className="installGuide__pointer" aria-hidden>
+            <span className="installGuide__pointerLabel">Share button is down here</span>
+            <ChevronDown size={28} className="installGuide__pointerArrow" />
+          </div>
+        </div>
       )}
-      <button
-        className="installBanner__close"
-        onClick={dismiss}
-        aria-label="Dismiss install hint"
-        type="button"
-      >
-        <X size={16} />
-      </button>
-    </section>
+    </>
   );
 }
