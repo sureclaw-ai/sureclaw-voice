@@ -1,0 +1,14 @@
+{
+  // Type-checks the service worker against the WebWorker lib instead of DOM
+  // (incompatible `self`/event globals can't share a program). Inherits the rest
+  // of the app's compiler options from the base config.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "WebWorker"],
+    "types": []
+  },
+  // The base excludes sw.ts (it belongs to this program, not the app's); clear
+  // that inherited exclude so our include below actually matches.
+  "exclude": [],
+  "include": ["src/sw.ts"]
+}

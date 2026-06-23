@@ -1,4 +1,11 @@
-// CACHE_NAME is rewritten at build time by the `sw-cache-version` Vite plugin,
+/// <reference lib="webworker" />
+
+// Typed handle to the service-worker global scope. `self` is declared as the
+// generic WorkerGlobalScope in the WebWorker lib, so we narrow it once here to
+// get `skipWaiting`/`clients` and the install/activate/fetch event types.
+const sw = self as unknown as ServiceWorkerGlobalScope;
+
+// CACHE_NAME is rewritten at build time by the `service-worker` Vite plugin,
 // which replaces the BUILD_HASH token with a hash of the bundled JS/CSS. This
 // means the cache is automatically busted whenever app content changes — no
 // manual version bump required.
@@ -7,23 +14,25 @@ const CACHE_NAME = "openclaw-voice-__BUILD_HASH__";
 // whether it's served from the site root or a mount path (e.g. /voice/).
 const APP_SHELL = ["./", "./manifest.webmanifest", "./offline.html"];
 
-self.addEventListener("install", (event) => {
+sw.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
-  self.skipWaiting();
+  sw.skipWaiting();
 });
 
-self.addEventListener("activate", (event) => {
+sw.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))),
-      ),
+    caches.keys().then((keys) => {
+      const stale: Array<Promise<boolean>> = [];
+      for (const key of keys) {
+        if (key !== CACHE_NAME) stale.push(caches.delete(key));
+      }
+      return Promise.all(stale);
+    }),
   );
-  self.clients.claim();
+  sw.clients.claim();
 });
 
-self.addEventListener("fetch", (event) => {
+sw.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
   // Only app-shell navigations fall back to the cached shell (or offline page).
@@ -39,7 +48,10 @@ self.addEventListener("fetch", (event) => {
           }
           return response;
         })
-        .catch(() => caches.match(request).then((cached) => cached || caches.match("./"))),
+        .catch(
+          async () =>
+            (await caches.match(request)) ?? (await caches.match("./")) ?? Response.error(),
+        ),
     );
     return;
   }
@@ -55,8 +67,8 @@ self.addEventListener("fetch", (event) => {
           }
           return response;
         })
-        .catch(() => cached);
-      return cached || network;
+        .catch(() => cached ?? Response.error());
+      return cached ?? network;
     }),
   );
 });

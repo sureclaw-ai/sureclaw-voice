@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && tsc -p tsconfig.worker.json && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "deploy": "tsc -b && vite build && wrangler deploy",
+    "deploy": "tsc -b && tsc -p tsconfig.worker.json && vite build && wrangler deploy",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "fmt": "oxfmt",

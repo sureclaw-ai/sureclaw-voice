@@ -16,5 +16,8 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The service worker is type-checked separately via tsconfig.worker.json,
+  // which uses the WebWorker lib instead of DOM (different `self`/event types).
+  "exclude": ["src/sw.ts"]
 }
