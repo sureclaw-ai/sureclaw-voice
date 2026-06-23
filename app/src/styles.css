@@ -34,6 +34,12 @@ body {
   overscroll-behavior: none;
 }
 
+html {
+  /* Match the bottom of the body gradient so the iOS safe-area /
+     home-indicator region isn't filled with pure black. */
+  background: var(--bg);
+}
+
 body {
   min-height: 100dvh;
   background: radial-gradient(120% 80% at 50% -10%, var(--bg-2), var(--bg) 60%);
