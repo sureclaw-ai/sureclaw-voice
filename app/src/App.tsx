@@ -28,6 +28,24 @@ function readAssistantName(): string {
 
 const APP_NAME = readAssistantName();
 
+// Reads the gateway's auth mode from the <meta name="x-app-gateway-auth"> tag,
+// which the gateway rewrites from __APP_GATEWAY_AUTH__ at serve time. When the
+// gateway authenticates the WebSocket through a trusted proxy (e.g. Cloudflare
+// Access) rather than a token or password, there is no credential for the user
+// to enter — so we hide the Settings sheet entirely. Any other value (token,
+// password, or the unsubstituted placeholder seen on the raw Vite dev server)
+// keeps Settings available for manual overrides.
+function isProxyAuthedGateway(): boolean {
+  return (
+    document
+      .querySelector('meta[name="x-app-gateway-auth"]')
+      ?.getAttribute("content")
+      ?.trim() === "trusted-proxy"
+  );
+}
+
+const PROXY_AUTHED = isProxyAuthedGateway();
+
 // Same-origin Gateway endpoint. When the app is served by the OpenClaw gateway
 // itself (e.g. https://host/voice behind cloudflared), the WebSocket goes back
 // to the same host — no hardcoded customer domain. Falls back to localhost for
@@ -289,11 +307,11 @@ export default function App() {
   useEffect(() => {
     if (!showSettings) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && settings.secret) setShowSettings(false);
+      if (event.key === "Escape") setShowSettings(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showSettings, settings.secret]);
+  }, [showSettings]);
 
   return (
     <main className="app">
@@ -301,14 +319,16 @@ export default function App() {
 
       <header className="bar">
         <span />
-        <button
-          type="button"
-          className="iconButton"
-          onClick={() => setShowSettings((value) => !value)}
-          aria-label="Settings"
-        >
-          <Settings size={20} />
-        </button>
+        {!PROXY_AUTHED && (
+          <button
+            type="button"
+            className="iconButton"
+            onClick={() => setShowSettings((value) => !value)}
+            aria-label="Settings"
+          >
+            <Settings size={20} />
+          </button>
+        )}
       </header>
 
       <section className={`stage ${status}`}>
@@ -344,29 +364,25 @@ export default function App() {
         </div>
       </section>
 
-      {showSettings && (
+      {showSettings && !PROXY_AUTHED && (
         <div className="sheetBackdrop">
-          {settings.secret && (
-            <button
-              type="button"
-              className="sheetBackdrop__dismiss"
-              aria-label="Close settings"
-              onClick={() => setShowSettings(false)}
-            />
-          )}
+          <button
+            type="button"
+            className="sheetBackdrop__dismiss"
+            aria-label="Close settings"
+            onClick={() => setShowSettings(false)}
+          />
           <dialog open className="sheet" aria-label="Settings">
             <div className="sheetHead">
               <h2>Settings</h2>
-              {settings.secret && (
-                <button
-                  type="button"
-                  className="iconButton"
-                  onClick={() => setShowSettings(false)}
-                  aria-label="Close"
-                >
-                  <X size={18} />
-                </button>
-              )}
+              <button
+                type="button"
+                className="iconButton"
+                onClick={() => setShowSettings(false)}
+                aria-label="Close"
+              >
+                <X size={18} />
+              </button>
             </div>
             <form onSubmit={saveSettings}>
               <label>
