@@ -7,7 +7,7 @@ const sw = self;
 // which replaces the BUILD_HASH token with a hash of the bundled JS/CSS. This
 // means the cache is automatically busted whenever app content changes — no
 // manual version bump required.
-const CACHE_NAME = "openclaw-voice-61dd45b33e2a";
+const CACHE_NAME = "openclaw-voice-bec0139155be";
 // Relative to the service worker's scope so the app shell caches correctly
 // whether it's served from the site root or a mount path (e.g. /voice/).
 const APP_SHELL = [

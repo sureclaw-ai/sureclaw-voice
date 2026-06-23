@@ -170,7 +170,8 @@ function registerWebappRoute(api) {
 	const tokens = {
 		__APP_NAME__: (configuredName || "OpenClaw").slice(0, 60),
 		__APP_FULL_NAME__: (configuredName || "SureClaw Voice").slice(0, 60),
-		__APP_SHORT_NAME__: (configuredName || "SureClaw Voice").slice(0, 60)
+		__APP_SHORT_NAME__: (configuredName || "SureClaw Voice").slice(0, 60),
+		__APP_GATEWAY_AUTH__: api.config?.gateway?.auth?.mode ?? "token"
 	};
 	const mount = normalizeWebappMount(webapp?.path ?? DEFAULT_WEBAPP_MOUNT);
 	api.registerHttpRoute({
