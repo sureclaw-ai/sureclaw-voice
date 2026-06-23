@@ -14,9 +14,8 @@
     "fmt:check": "oxfmt --check",
     "knip": "knip",
     "knip:fix": "knip --fix",
-    "react-docter": "react-doctor --no-score",
-    "superlint": "pnpm run lint && pnpm run fmt:check && pnpm run knip && pnpm run react-docter",
-    "superfix": "pnpm run lint:fix && pnpm run fmt && pnpm run knip:fix && pnpm run react-docter"
+    "superlint": "pnpm run lint && pnpm run fmt:check && pnpm run knip",
+    "superfix": "pnpm run lint:fix && pnpm run fmt && pnpm run knip:fix"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^6.0.0",
@@ -32,7 +31,7 @@
     "knip": "^6.17.1",
     "oxfmt": "^0.55.0",
     "oxlint": "^1.70.0",
-    "react-doctor": "^0.5.8",
+    "oxlint-plugin-react-doctor": "^0.5.8",
     "wrangler": "^4.101.0"
   }
 }
