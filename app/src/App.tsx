@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { Phone, PhoneOff, RotateCcw, Settings, X } from "lucide-react";
+import { Mic, MicOff, Phone, PhoneOff, RotateCcw, Settings, X } from "lucide-react";
 import type { CallStatus, GatewaySettings, RealtimeBrowserSession, TranscriptEntry } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
 import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
@@ -104,6 +104,7 @@ export default function App() {
   const [streams, setStreams] = useState<Array<{ kind: "mic" | "remote"; stream: MediaStream }>>(
     [],
   );
+  const [muted, setMuted] = useState(false);
   const gatewayRef = useRef<GatewayClient | null>(null);
   const callRef = useRef<OpenAIRealtimeCall | null>(null);
   // Whether the user currently intends to be in a call. Guards against a late
@@ -218,6 +219,7 @@ export default function App() {
     gatewayRef.current?.disconnect();
     gatewayRef.current = null;
     setStreams([]);
+    setMuted(false);
   }
 
   function raiseFatalError(title: string, reason: string) {
@@ -235,6 +237,14 @@ export default function App() {
     setStatus("idle");
     setDetail("");
     log("Call ended");
+  }
+
+  function toggleMute() {
+    setMuted((current) => {
+      const next = !current;
+      callRef.current?.setMicMuted(next);
+      return next;
+    });
   }
 
   function dismissError() {
@@ -351,10 +361,21 @@ export default function App() {
               </button>
             </>
           ) : active ? (
-            <button type="button" className="callButton end" onClick={stopCall}>
-              <PhoneOff size={22} />
-              End call
-            </button>
+            <>
+              <button
+                type="button"
+                className={`callButton mute ${muted ? "muted" : ""}`}
+                onClick={toggleMute}
+                aria-pressed={muted}
+              >
+                {muted ? <MicOff size={22} /> : <Mic size={22} />}
+                {muted ? "Unmute" : "Mute"}
+              </button>
+              <button type="button" className="callButton end" onClick={stopCall}>
+                <PhoneOff size={22} />
+                End call
+              </button>
+            </>
           ) : (
             <button type="button" className="callButton call" onClick={startCall}>
               <Phone size={22} />

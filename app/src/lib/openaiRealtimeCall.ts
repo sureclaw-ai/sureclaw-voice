@@ -206,6 +206,17 @@ export class OpenAIRealtimeCall {
     this.turnDetectionSuspended = false;
   }
 
+  setMicMuted(muted: boolean) {
+    this.media?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
+  }
+
+  isMicMuted(): boolean {
+    const tracks = this.media?.getAudioTracks() ?? [];
+    return tracks.length > 0 && tracks.every((track) => !track.enabled);
+  }
+
   private send(event: unknown) {
     const type = (event as { type?: string } | null)?.type ?? "unknown";
     if (this.channel?.readyState === "open") {

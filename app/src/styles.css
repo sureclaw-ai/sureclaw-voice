@@ -253,6 +253,23 @@ select {
   box-shadow: 0 14px 36px -12px var(--red);
 }
 
+.callButton.mute {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  box-shadow: none;
+}
+
+.callButton.mute:hover {
+  filter: brightness(1.12);
+}
+
+.callButton.mute.muted {
+  background: var(--muted);
+  color: var(--bg);
+  border-color: transparent;
+}
+
 .textButton {
   background: none;
   border: 0;
