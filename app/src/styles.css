@@ -273,8 +273,24 @@ select {
   z-index: 10;
 }
 
+.sheetBackdrop__dismiss {
+  position: absolute;
+  inset: 0;
+  border: none;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: default;
+}
+
 .sheet {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  color: inherit;
   width: min(440px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 16px;

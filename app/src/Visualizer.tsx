@@ -19,11 +19,13 @@ type VisualizerProps = {
 export function Visualizer({ streams, status }: VisualizerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const barsRef = useRef<Array<HTMLSpanElement | null>>([]);
-  const levelsRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
+  const levelsRef = useRef<number[] | null>(null);
+  levelsRef.current ??= Array.from({ length: BAR_COUNT }, () => 0);
 
   useEffect(() => {
+    const levels = levelsRef.current!;
     const reset = () => {
-      levelsRef.current.fill(0);
+      levels.fill(0);
       barsRef.current.forEach((bar) => bar && (bar.style.transform = "scaleY(0.05)"));
     };
 
@@ -85,11 +87,11 @@ export function Visualizer({ streams, status }: VisualizerProps) {
         const raw = Math.max(userBars[i], clawBars[i]);
         const gated = raw <= NOISE_GATE ? 0 : (raw - NOISE_GATE) / (1 - NOISE_GATE);
         const target = Math.min(1, Math.pow(gated, 0.85) * 1.6);
-        const next = levelsRef.current[i] + (target - levelsRef.current[i]) * 0.45;
-        levelsRef.current[i] = next < 0.001 ? 0 : next;
+        const next = levels[i] + (target - levels[i]) * 0.45;
+        levels[i] = next < 0.001 ? 0 : next;
 
         const bar = barsRef.current[i];
-        if (bar) bar.style.transform = `scaleY(${0.05 + levelsRef.current[i] * 0.95})`;
+        if (bar) bar.style.transform = `scaleY(${0.05 + levels[i] * 0.95})`;
       }
 
       // Tint by the dominant speaker; hold the last one through brief silences.

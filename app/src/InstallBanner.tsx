@@ -33,6 +33,8 @@ function detectPlatform(): MobilePlatform | null {
   return null;
 }
 
+const PLATFORM = detectPlatform();
+
 function isStandalone(): boolean {
   if (typeof window === "undefined") return false;
   return (
@@ -52,7 +54,6 @@ function wasDismissed(): boolean {
 }
 
 export function InstallBanner({ appName }: { appName: string }) {
-  const [platform] = useState(detectPlatform);
   const [dismissed, setDismissed] = useState(wasDismissed);
   const [standalone, setStandalone] = useState(isStandalone);
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -75,7 +76,7 @@ export function InstallBanner({ appName }: { appName: string }) {
     };
   }, []);
 
-  if (!platform || standalone || dismissed) return null;
+  if (!PLATFORM || standalone || dismissed) return null;
 
   function dismiss() {
     try {
@@ -96,12 +97,12 @@ export function InstallBanner({ appName }: { appName: string }) {
   }
 
   return (
-    <div className="installBanner" role="region" aria-label="Install app">
+    <section className="installBanner" aria-label="Install app">
       <img className="installBanner__icon" src="./icon.svg" alt="" aria-hidden />
       <p className="installBanner__text">
-        {platform === "android" && deferredPrompt ? (
+        {PLATFORM === "android" && deferredPrompt ? (
           <>Install {appName} for a full-screen, app-like experience.</>
-        ) : platform === "ios" ? (
+        ) : PLATFORM === "ios" ? (
           <>
             Install {appName}: tap{" "}
             <Share size={15} className="installBanner__glyph" aria-label="Share" /> then{" "}
@@ -114,7 +115,7 @@ export function InstallBanner({ appName }: { appName: string }) {
           </>
         )}
       </p>
-      {platform === "android" && deferredPrompt && (
+      {PLATFORM === "android" && deferredPrompt && (
         <button className="installBanner__action" onClick={install} type="button">
           <Plus size={15} />
           Install
@@ -128,6 +129,6 @@ export function InstallBanner({ appName }: { appName: string }) {
       >
         <X size={16} />
       </button>
-    </div>
+    </section>
   );
 }

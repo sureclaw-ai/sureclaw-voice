@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Phone, PhoneOff, RotateCcw, Settings, X } from "lucide-react";
 import type { CallStatus, GatewaySettings, RealtimeBrowserSession, TranscriptEntry } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
@@ -41,6 +41,18 @@ function defaultGatewayUrl(): string {
   return "ws://127.0.0.1:18789";
 }
 
+function log(line: string) {
+  console.log(`[voice] ${new Date().toLocaleTimeString()} ${line}`);
+}
+
+function describeStatus(status: CallStatus): string {
+  if (status === "idle") return "Ready to call";
+  if (status === "connecting") return "Connecting…";
+  if (status === "listening") return "Listening";
+  if (status === "thinking") return "Thinking…";
+  return "Call interrupted";
+}
+
 const defaultSettings: GatewaySettings = {
   gatewayUrl: defaultGatewayUrl(),
   authMode: "token",
@@ -59,6 +71,7 @@ function loadSettings(): GatewaySettings {
   }
 }
 
+// oxlint-disable-next-line react-doctor/no-giant-component, react-doctor/prefer-useReducer
 export default function App() {
   const [settings, setSettings] = useState<GatewaySettings>(() => loadSettings());
   const [saved, setSaved] = useState(false);
@@ -83,13 +96,7 @@ export default function App() {
   // state (not on every re-render or the listening⇄thinking toggle).
   const prevStatusRef = useRef<CallStatus>("idle");
 
-  const statusText = useMemo(() => {
-    if (status === "idle") return "Ready to call";
-    if (status === "connecting") return "Connecting…";
-    if (status === "listening") return "Listening";
-    if (status === "thinking") return "Thinking…";
-    return "Call interrupted";
-  }, [status]);
+  const statusText = describeStatus(status);
 
   function updateSettings(next: Partial<GatewaySettings>) {
     setSettings((current) => ({ ...current, ...next }));
@@ -101,10 +108,6 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1600);
-  }
-
-  function log(line: string) {
-    console.log(`[voice] ${new Date().toLocaleTimeString()} ${line}`);
   }
 
   function addStream(kind: "mic" | "remote", stream: MediaStream) {
@@ -268,6 +271,7 @@ export default function App() {
   // tone if it drops to an error. Hang-up is handled in stopCall (a gesture).
   useEffect(() => {
     const prev = prevStatusRef.current;
+    // oxlint-disable-next-line react-doctor/no-event-handler
     if (status !== prev) {
       if (status === "connecting") {
         callSounds.startRinging();
@@ -282,13 +286,23 @@ export default function App() {
     }
   }, [status]);
 
+  useEffect(() => {
+    if (!showSettings) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && settings.secret) setShowSettings(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showSettings, settings.secret]);
+
   return (
     <main className="app">
       <InstallBanner appName={APP_NAME} />
 
       <header className="bar">
-        <span></span>
+        <span />
         <button
+          type="button"
           className="iconButton"
           onClick={() => setShowSettings((value) => !value)}
           aria-label="Settings"
@@ -308,21 +322,21 @@ export default function App() {
         <div className="dock">
           {isError ? (
             <>
-              <button className="callButton call" onClick={startCall}>
+              <button type="button" className="callButton call" onClick={startCall}>
                 <RotateCcw size={22} />
                 Reconnect
               </button>
-              <button className="textButton" onClick={dismissError}>
+              <button type="button" className="textButton" onClick={dismissError}>
                 Dismiss
               </button>
             </>
           ) : active ? (
-            <button className="callButton end" onClick={stopCall}>
+            <button type="button" className="callButton end" onClick={stopCall}>
               <PhoneOff size={22} />
               End call
             </button>
           ) : (
-            <button className="callButton call" onClick={startCall}>
+            <button type="button" className="callButton call" onClick={startCall}>
               <Phone size={22} />
               Call {APP_NAME}
             </button>
@@ -331,12 +345,21 @@ export default function App() {
       </section>
 
       {showSettings && (
-        <div className="sheetBackdrop" onClick={() => settings.secret && setShowSettings(false)}>
-          <section className="sheet" onClick={(event) => event.stopPropagation()}>
+        <div className="sheetBackdrop">
+          {settings.secret && (
+            <button
+              type="button"
+              className="sheetBackdrop__dismiss"
+              aria-label="Close settings"
+              onClick={() => setShowSettings(false)}
+            />
+          )}
+          <dialog open className="sheet" aria-label="Settings">
             <div className="sheetHead">
               <h2>Settings</h2>
               {settings.secret && (
                 <button
+                  type="button"
                   className="iconButton"
                   onClick={() => setShowSettings(false)}
                   aria-label="Close"
@@ -390,7 +413,7 @@ export default function App() {
                 {saved ? "Saved" : "Save"}
               </button>
             </form>
-          </section>
+          </dialog>
         </div>
       )}
     </main>
@@ -420,6 +443,7 @@ async function createDiscordVoiceSessionWithRetry(
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
+      // oxlint-disable-next-line react-doctor/async-await-in-loop
       return (await gateway.request(
         "browserVoice.create",
         params,

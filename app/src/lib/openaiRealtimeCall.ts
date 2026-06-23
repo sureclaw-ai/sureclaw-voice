@@ -117,7 +117,7 @@ export class OpenAIRealtimeCall {
       body: offer.sdp || "",
       headers: {
         Authorization: `Bearer ${this.session.clientSecret}`,
-        ...(this.session.offerHeaders || {}),
+        ...this.session.offerHeaders,
         "Content-Type": "application/sdp",
       },
     });
