@@ -3,6 +3,38 @@ import { GatewayClient } from "./gatewayClient";
 
 type RealtimeEvent = Record<string, unknown> & { type?: string };
 
+// The OpenClaw `chat` "final" payload's `message` can arrive as a plain string,
+// an array of content parts (e.g. OpenAI-style `[{ type: "text", text: "..." }]`
+// or string parts), an object with `{ text }`, or occasionally a number/boolean.
+// Coerce any shape to a single trimmed string so the consult result feeds back
+// to the realtime session without a `trim is not a function` crash.
+function extractChatMessage(message: unknown): string {
+  const partsToString = (parts: unknown[]): string =>
+    parts
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (p && typeof p === "object") {
+          const obj = p as { text?: unknown; content?: unknown };
+          if (typeof obj.text === "string") return obj.text;
+          if (typeof obj.content === "string") return obj.content;
+        }
+        return "";
+      })
+      .join("");
+  let text: string;
+  if (typeof message === "string") text = message;
+  else if (Array.isArray(message)) text = partsToString(message);
+  else if (message && typeof message === "object") {
+    const obj = message as { text?: unknown; content?: unknown; message?: unknown };
+    if (typeof obj.text === "string") text = obj.text;
+    else if (Array.isArray(obj.content)) text = partsToString(obj.content);
+    else if (typeof obj.content === "string") text = obj.content;
+    else if (Array.isArray(obj.message)) text = partsToString(obj.message);
+    else text = "";
+  } else text = "";
+  return text.trim() || "OpenClaw finished with no text.";
+}
+
 type CallCallbacks = {
   onStatus: (status: CallStatus, detail?: string) => void;
   onTranscript: (entry: TranscriptEntry) => void;
@@ -274,7 +306,15 @@ export class OpenAIRealtimeCall {
       case "response.done":
         this.responseActive = false;
         this.responseCreateInFlight = false;
-        this.callbacks.onStatus("listening");
+        // The response that carried a function call completes (response.done)
+        // while the consult it triggered is still running. Don't flip back to
+        // "listening" yet — that would clear the pending consult cue mid-flight,
+        // leaving the line dead silent. Hold the pending state until the consult
+        // resolves and its answer starts generating.
+        this.callbacks.onStatus(
+          this.toolCallsInFlight > 0 ? "thinking" : "listening",
+          this.toolCallsInFlight > 0 ? "Working on that, this might take a while..." : "",
+        );
         this.flushPendingResponseCreate();
         this.maybeResumeTurnDetection();
         return;
@@ -325,7 +365,7 @@ export class OpenAIRealtimeCall {
     const args = buffered?.args || stringField(event, "arguments") || "{}";
     if (!callId || name !== "openclaw_agent_consult") return;
 
-    this.callbacks.onStatus("thinking", "Asking OpenClaw");
+    this.callbacks.onStatus("thinking", "Working on that, this might take a while...");
     this.callbacks.onLog("Forwarding realtime tool call to OpenClaw");
     // The consult can take several seconds. Server VAD ships with
     // create_response/interrupt_response enabled, so without this the model
@@ -440,7 +480,7 @@ export class OpenAIRealtimeCall {
         const chat = payload as {
           runId?: string;
           state?: string;
-          message?: string;
+          message?: unknown;
           errorMessage?: string;
         };
         console.debug(
@@ -449,7 +489,7 @@ export class OpenAIRealtimeCall {
         );
         if (chat.runId !== runId) return;
         if (chat.state === "final")
-          cleanup(() => resolve(chat.message?.trim() || "OpenClaw finished with no text."));
+          cleanup(() => resolve(extractChatMessage(chat.message)));
         if (chat.state === "aborted")
           cleanup(() =>
             reject(new DOMException(chat.errorMessage || "OpenClaw aborted", "AbortError")),

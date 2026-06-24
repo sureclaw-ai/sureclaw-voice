@@ -174,7 +174,7 @@ export default function App() {
     if (sessionKey !== settings.sessionKey) updateSettings({ sessionKey });
 
     setDetail("Setting up voice");
-    const voiceSession = await createDiscordVoiceSessionWithRetry(
+    const voiceSession = await createVoiceSessionWithRetry(
       gateway,
       {
         sessionKey,
@@ -313,6 +313,17 @@ export default function App() {
       prevStatusRef.current = status;
     }
   }, [status]);
+
+  // While the call hands off to OpenClaw (a consult that can take many
+  // seconds), the line goes dead silent. Fill it with the soft "pending"
+  // pulse — same theme as the other call cues — and kill it the moment the
+  // consult resolves or the call leaves the consult state.
+  useEffect(() => {
+    const consulting =
+      status === "thinking" && detail === "Working on that, this might take a while...";
+    if (consulting) callSounds.startPending();
+    else callSounds.stopPending();
+  }, [status, detail]);
 
   useEffect(() => {
     if (!showSettings) return;
@@ -471,7 +482,7 @@ async function resolveSessionKey(gateway: GatewayClient, explicit: string) {
   return "agent:main:direct:openclaw-voice-pwa";
 }
 
-async function createDiscordVoiceSessionWithRetry(
+async function createVoiceSessionWithRetry(
   gateway: GatewayClient,
   params: Record<string, unknown>,
   onRetry: (attempt: number) => void,
@@ -498,7 +509,7 @@ async function createDiscordVoiceSessionWithRetry(
 
 function isTransientVoiceSessionError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return /UND_ERR_SOCKET|SocketError|other side closed|terminated|Gateway request timed out: discordVoice\.browser\.create/i.test(
+  return /UND_ERR_SOCKET|SocketError|other side closed|terminated|Gateway request timed out: browserVoice\.create/i.test(
     message,
   );
 }

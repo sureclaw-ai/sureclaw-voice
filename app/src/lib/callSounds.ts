@@ -25,6 +25,7 @@ class CallSounds {
   // not over, the voice. ~0.18 is a soft "UI chime" level.
   private master: GainNode | null = null;
   private ringTimer: number | null = null;
+  private pendingTimer: number | null = null;
 
   // Lazily build the AudioContext. Browsers start it suspended until a user
   // gesture, which is why unlock() is called from the click handlers.
@@ -94,6 +95,30 @@ class CallSounds {
     if (this.ringTimer !== null) {
       window.clearInterval(this.ringTimer);
       this.ringTimer = null;
+    }
+  }
+
+  // "Agent is thinking" pulse: a single soft, slow-decaying sine ping repeated
+  // on a roomy cycle while an OpenClaw consult is in flight. Same palette as the
+  // ring tone (pure sines, soft gain) but sparser and rounder so it reads as
+  // contemplation rather than alerting — filling the otherwise dead silence
+  // without competing with the eventual spoken answer.
+  startPending() {
+    this.unlock();
+    if (this.pendingTimer !== null) return; // already pending
+    const pulse = () => {
+      // A gentle rising fifth (C5 → G5) with a long tail — soft, open, patient.
+      this.tone(NOTE.C5, 0, 0.34, { gain: 0.55 });
+      this.tone(NOTE.G5, 0.18, 0.5, { gain: 0.45 });
+    };
+    pulse();
+    this.pendingTimer = window.setInterval(pulse, 2400);
+  }
+
+  stopPending() {
+    if (this.pendingTimer !== null) {
+      window.clearInterval(this.pendingTimer);
+      this.pendingTimer = null;
     }
   }
 
