@@ -7,31 +7,19 @@ import { resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk
 import { REALTIME_VOICE_AGENT_CONSULT_TOOL, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy } from "openclaw/plugin-sdk/realtime-voice";
 //#region index.ts
 const PLUGIN_ID = "sureclaw-voice";
-const VOICE_CALL_PLUGIN_ID = "voice-call";
 function resolveBrowserRealtimeConfig(cfg) {
-	const voiceCall = cfg.plugins?.entries?.[VOICE_CALL_PLUGIN_ID]?.config?.realtime;
-	if (voiceCall && voiceCall.enabled !== false) return {
-		realtimeConfig: normalizeRealtimeConfig(voiceCall),
-		mode: "agent-proxy",
-		source: VOICE_CALL_PLUGIN_ID
-	};
-	const discord = cfg.channels?.discord?.voice?.realtime;
-	if (discord) return {
-		realtimeConfig: normalizeRealtimeConfig(discord),
-		mode: normalizeDiscordVoiceMode(cfg.channels?.discord?.voice?.mode),
-		source: "discord"
-	};
-}
-function normalizeRealtimeConfig(realtime) {
+	const config = cfg.plugins?.entries?.[PLUGIN_ID]?.config;
+	const realtime = config?.realtime;
+	if (!realtime || realtime.enabled === false) return void 0;
 	return {
-		...realtime,
-		bootstrapContextFiles: realtime.bootstrapContextFiles ?? realtime.agentContext?.files
+		realtimeConfig: realtime,
+		mode: normalizeVoiceMode(config?.mode ?? realtime.mode)
 	};
 }
 const entry = definePluginEntry({
 	id: "sureclaw-voice",
 	name: "SureClaw Voice",
-	description: "Serves the voice web app and mints browser WebRTC realtime sessions from the configured realtime voice config (voice-call, falling back to Discord voice).",
+	description: "Serves the voice web app and mints browser WebRTC realtime sessions from the plugin's own realtime voice config.",
 	configSchema: {
 		type: "object",
 		additionalProperties: false,
@@ -62,6 +50,18 @@ const entry = definePluginEntry({
 					dir: { type: "string" },
 					name: { type: "string" }
 				}
+			},
+			mode: {
+				type: "string",
+				enum: [
+					"agent-proxy",
+					"stt-tts",
+					"bidi"
+				]
+			},
+			realtime: {
+				type: "object",
+				additionalProperties: true
 			}
 		}
 	},
@@ -82,7 +82,7 @@ const entry = definePluginEntry({
 				if (!resolved) {
 					respond(false, void 0, {
 						code: "UNAVAILABLE",
-						message: "No realtime voice config found — configure plugins.entries.voice-call.config.realtime or channels.discord.voice.realtime"
+						message: "No realtime voice config found — configure plugins.entries.sureclaw-voice.config.realtime"
 					});
 					return;
 				}
@@ -114,7 +114,7 @@ const entry = definePluginEntry({
 				const session = await resolution.provider.createBrowserSession({
 					cfg,
 					providerConfig: resolution.providerConfig,
-					instructions: buildDiscordRealtimeInstructions({
+					instructions: buildRealtimeInstructions({
 						mode,
 						instructions: realtimeConfig.instructions,
 						bootstrapContextInstructions,
@@ -314,7 +314,7 @@ async function resolveBootstrapContext(params) {
 		return;
 	}
 }
-function normalizeDiscordVoiceMode(mode) {
+function normalizeVoiceMode(mode) {
 	if (mode === "stt-tts" || mode === "bidi") return mode;
 	return "agent-proxy";
 }
@@ -330,8 +330,8 @@ function buildProviderConfigOverrides(realtimeConfig) {
 	};
 	return Object.keys(overrides).length > 0 ? overrides : void 0;
 }
-function buildDiscordRealtimeInstructions(params) {
-	const base = params.instructions ?? ["You are OpenClaw's Discord voice interface.", "Keep spoken replies concise, natural, and suitable for a live Discord voice channel."].join("\n");
+function buildRealtimeInstructions(params) {
+	const base = params.instructions ?? ["You are OpenClaw's voice interface.", "Keep spoken replies concise, natural, and suitable for a live voice call."].join("\n");
 	const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
 	if (params.mode === "agent-proxy") return [
 		base,
