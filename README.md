@@ -7,9 +7,9 @@ the HTTPS page and the WSS gateway connection — put cloudflared (or any HTTPS
 terminator) in front of the gateway port and you're done.
 
 - App at `https://<host>/voice`, WebSocket back to `wss://<host>` — same origin.
-- Realtime voice config is **reused** from your existing setup (`voice-call`,
-  falling back to `channels.discord.voice.realtime`) — browser calls behave like
-  your phone calls; no separate tuning.
+- Realtime voice config lives in the plugin's own config under
+  `plugins.entries.sureclaw-voice.config.realtime` (provider, model, voice,
+  instructions, tool/consult policy).
 - The plugin does **no auth** — the gateway authenticates the WebSocket itself.
 
 ## Install

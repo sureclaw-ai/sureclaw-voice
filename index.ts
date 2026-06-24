@@ -16,7 +16,7 @@ type BrowserVoiceParams = {
   agentId?: string;
 };
 
-type DiscordRealtimeConfig = {
+type RealtimeVoiceConfig = {
   enabled?: boolean;
   provider?: string;
   providers?: Record<string, unknown>;
@@ -27,9 +27,6 @@ type DiscordRealtimeConfig = {
   consultPolicy?: string;
   toolPolicy?: string;
   bootstrapContextFiles?: string[];
-  // voice-call's equivalent of bootstrapContextFiles. Normalized into
-  // bootstrapContextFiles when sourcing realtime config from voice-call.
-  agentContext?: { enabled?: boolean; files?: string[] };
   minBargeInAudioEndMs?: number;
 };
 
@@ -76,67 +73,36 @@ type WebappConfig = {
 type PluginConfig = {
   webrtc?: WebRtcConfig;
   webapp?: WebappConfig;
+  realtime?: RealtimeVoiceConfig;
+  mode?: string;
 };
 
 type RuntimeConfig = {
-  channels?: {
-    discord?: {
-      voice?: {
-        mode?: string;
-        realtime?: DiscordRealtimeConfig;
-      };
-    };
-  };
   plugins?: {
-    entries?: Record<
-      string,
-      { config?: { webrtc?: WebRtcConfig; realtime?: DiscordRealtimeConfig } }
-    >;
+    entries?: Record<string, { config?: PluginConfig }>;
   };
 };
 
 const PLUGIN_ID = "sureclaw-voice";
-const VOICE_CALL_PLUGIN_ID = "voice-call";
 
-// Resolves the realtime voice config the browser session should use. Realtime
-// config is attached per transport, so we fall back across the known sources:
-//   1. voice-call's realtime block — the shared config used for phone calls
-//      (read-only; the browser session inherits the same proven settings).
-//   2. channels.discord.voice.realtime — the legacy Discord voice surface.
-// voice-call stores its bootstrap context under agentContext.files, so that is
-// normalized into bootstrapContextFiles for the shared instruction builder.
+// Resolves the realtime voice config for the browser session from this plugin's
+// own config slot (plugins.entries.sureclaw-voice.config.realtime), the same
+// place webrtc and webapp settings are owned. `mode` may sit alongside it under
+// config.mode or inside the realtime block.
 function resolveBrowserRealtimeConfig(
   cfg: RuntimeConfig,
-): { realtimeConfig: DiscordRealtimeConfig; mode: string; source: string } | undefined {
-  const voiceCall = cfg.plugins?.entries?.[VOICE_CALL_PLUGIN_ID]?.config?.realtime;
-  if (voiceCall && voiceCall.enabled !== false) {
-    return { realtimeConfig: normalizeRealtimeConfig(voiceCall), mode: "agent-proxy", source: VOICE_CALL_PLUGIN_ID };
-  }
-
-  const discord = cfg.channels?.discord?.voice?.realtime;
-  if (discord) {
-    return {
-      realtimeConfig: normalizeRealtimeConfig(discord),
-      mode: normalizeDiscordVoiceMode(cfg.channels?.discord?.voice?.mode),
-      source: "discord",
-    };
-  }
-
-  return undefined;
-}
-
-function normalizeRealtimeConfig(realtime: DiscordRealtimeConfig): DiscordRealtimeConfig {
-  return {
-    ...realtime,
-    bootstrapContextFiles: realtime.bootstrapContextFiles ?? realtime.agentContext?.files,
-  };
+): { realtimeConfig: RealtimeVoiceConfig; mode: string } | undefined {
+  const config = cfg.plugins?.entries?.[PLUGIN_ID]?.config;
+  const realtime = config?.realtime;
+  if (!realtime || realtime.enabled === false) return undefined;
+  return { realtimeConfig: realtime, mode: normalizeVoiceMode(config?.mode ?? realtime.mode) };
 }
 
 const entry = definePluginEntry({
   id: "sureclaw-voice",
   name: "SureClaw Voice",
   description:
-    "Serves the voice web app and mints browser WebRTC realtime sessions from the configured realtime voice config (voice-call, falling back to Discord voice).",
+    "Serves the voice web app and mints browser WebRTC realtime sessions from the plugin's own realtime voice config.",
 
   // Plugin config schema. The relay (STUN/TURN) settings live here under the
   // plugin's own `config` slot rather than in the host realtime block, which
@@ -172,6 +138,14 @@ const entry = definePluginEntry({
           name: { type: "string" },
         },
       },
+      // Session-wide voice mode. Defaults to "agent-proxy".
+      mode: { type: "string", enum: ["agent-proxy", "stt-tts", "bidi"] },
+      // Realtime voice config (provider, model, voice, instructions, tool/consult
+      // policy, etc.). Loosely validated — provider-specific keys vary by provider.
+      realtime: {
+        type: "object",
+        additionalProperties: true,
+      },
     },
   },
 
@@ -195,7 +169,7 @@ const entry = definePluginEntry({
           respond(false, undefined, {
             code: "UNAVAILABLE",
             message:
-              "No realtime voice config found — configure plugins.entries.voice-call.config.realtime or channels.discord.voice.realtime",
+              "No realtime voice config found — configure plugins.entries.sureclaw-voice.config.realtime",
           });
           return;
         }
@@ -234,7 +208,7 @@ const entry = definePluginEntry({
         const session = await resolution.provider.createBrowserSession({
           cfg,
           providerConfig: resolution.providerConfig,
-          instructions: buildDiscordRealtimeInstructions({
+          instructions: buildRealtimeInstructions({
             mode,
             instructions: realtimeConfig.instructions,
             bootstrapContextInstructions,
@@ -549,7 +523,7 @@ function normalizeParams(value: unknown): BrowserVoiceParams | undefined {
 
 async function resolveBootstrapContext(params: {
   cfg: RuntimeConfig;
-  realtimeConfig: DiscordRealtimeConfig;
+  realtimeConfig: RealtimeVoiceConfig;
   sessionKey: string;
   agentId?: string;
 }) {
@@ -573,17 +547,17 @@ async function resolveBootstrapContext(params: {
   }
 }
 
-function normalizeDiscordVoiceMode(mode: unknown) {
+function normalizeVoiceMode(mode: unknown) {
   if (mode === "stt-tts" || mode === "bidi") return mode;
   return "agent-proxy";
 }
 
-function buildProviderConfigs(realtimeConfig: DiscordRealtimeConfig) {
+function buildProviderConfigs(realtimeConfig: RealtimeVoiceConfig) {
   const configs = realtimeConfig.providers;
   return configs && Object.keys(configs).length > 0 ? { ...configs } : undefined;
 }
 
-function buildProviderConfigOverrides(realtimeConfig: DiscordRealtimeConfig) {
+function buildProviderConfigOverrides(realtimeConfig: RealtimeVoiceConfig) {
   const overrides = {
     ...(realtimeConfig.model ? { model: realtimeConfig.model } : {}),
     ...(realtimeConfig.voice ? { voice: realtimeConfig.voice } : {}),
@@ -594,7 +568,7 @@ function buildProviderConfigOverrides(realtimeConfig: DiscordRealtimeConfig) {
   return Object.keys(overrides).length > 0 ? overrides : undefined;
 }
 
-function buildDiscordRealtimeInstructions(params: {
+function buildRealtimeInstructions(params: {
   mode: string;
   instructions?: string;
   bootstrapContextInstructions?: string;
@@ -603,7 +577,7 @@ function buildDiscordRealtimeInstructions(params: {
 }) {
   const base =
     params.instructions ??
-    ["You are OpenClaw's Discord voice interface.", "Keep spoken replies concise, natural, and suitable for a live Discord voice channel."].join(
+    ["You are OpenClaw's voice interface.", "Keep spoken replies concise, natural, and suitable for a live voice call."].join(
       "\n",
     );
   const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);

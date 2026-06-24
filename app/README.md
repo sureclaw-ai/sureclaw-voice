@@ -35,7 +35,7 @@ From the repo root, `npm run build:app` builds this and stages it into `../webap
 
 1. Connect to the gateway WebSocket (same origin).
 2. `browserVoice.create` mints an OpenAI Realtime WebRTC session from the
-   gateway's realtime voice config (`voice-call`, or `channels.discord.voice.realtime`).
+   plugin's own realtime voice config (`plugins.entries.sureclaw-voice.config.realtime`).
 3. The browser runs the WebRTC call directly with the realtime provider;
    `openclaw_agent_consult` tool calls are forwarded back through the gateway
    (`talk.client.toolCall`) so the voice agent can use the full OpenClaw agent.
