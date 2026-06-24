@@ -1,0 +1,46 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "port": 18789,
+    "auth": { "mode": "none" },
+    "controlUi": {
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "openai/gpt-5.4",
+      "thinkingDefault": "medium"
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": ["${SURECLAW_VOICE_ROOT}"]
+    },
+    "entries": {
+      "sureclaw-voice": {
+        "enabled": true,
+        "config": {
+          "webapp": {
+            "enabled": true,
+            "path": "/voice",
+            "name": "SureClaw Voice"
+          },
+          "realtime": {
+            "provider": "openai",
+            "consultPolicy": "always",
+            "toolPolicy": "owner",
+            "providers": {
+              "openai": {
+                "apiKey": "${OPENAI_API_KEY}",
+                "model": "gpt-realtime-2",
+                "voice": "verse"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

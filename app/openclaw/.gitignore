@@ -1,0 +1,15 @@
+# Secrets — never commit. gateway.sh sources .env to populate OPENAI_API_KEY.
+.env
+.env.*
+
+# Local OpenClaw runtime state (OPENCLAW_STATE_DIR) — SQLite, workspace, logs.
+.state/
+
+# Stray gateway log files if you redirect output here.
+*.log
+
+# Local overrides to the config (secrets, custom ports, etc.).
+openclaw.local.json
+
+# Runtime snapshot of the last config the gateway loaded successfully.
+openclaw.json.last-good

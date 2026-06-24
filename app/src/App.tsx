@@ -49,9 +49,12 @@ const PROXY_AUTHED = isProxyAuthedGateway();
 // Same-origin Gateway endpoint. When the app is served by the OpenClaw gateway
 // itself (e.g. https://host/voice behind cloudflared), the WebSocket goes back
 // to the same host — no hardcoded customer domain. Falls back to localhost for
-// non-browser contexts. Override in Settings for local dev (an SSH tunnel to
-// ws://127.0.0.1:18789).
+// non-browser contexts. For local Vite HMR dev (page on :5173, gateway
+// elsewhere), `app/openclaw/dev.sh` injects VITE_GATEWAY_URL so the PWA targets
+// the auto-picked gateway WS without a manual Settings override.
 function defaultGatewayUrl(): string {
+  const injected = import.meta.env.VITE_GATEWAY_URL as string | undefined;
+  if (injected) return injected;
   if (typeof window !== "undefined" && window.location?.host) {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${window.location.host}`;
@@ -79,13 +82,19 @@ const defaultSettings: GatewaySettings = {
 };
 
 function loadSettings(): GatewaySettings {
+  // In Vite HMR dev, dev.sh injects VITE_GATEWAY_URL for the auto-picked
+  // gateway port. Treat it as authoritative — it wins over a stale
+  // localStorage URL so the PWA always hits the rig's WS, not a dead same-origin.
+  const injected = import.meta.env.VITE_GATEWAY_URL as string | undefined;
   try {
-    return {
+    const merged: GatewaySettings = {
       ...defaultSettings,
       ...JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"),
     };
+    if (injected) merged.gatewayUrl = injected;
+    return merged;
   } catch {
-    return defaultSettings;
+    return injected ? { ...defaultSettings, gatewayUrl: injected } : defaultSettings;
   }
 }
 

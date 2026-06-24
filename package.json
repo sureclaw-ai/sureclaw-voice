@@ -19,6 +19,9 @@
     }
   },
   "scripts": {
+    "dev": "bash app/openclaw/dev.sh",
+    "dev:gateway": "bash app/openclaw/gateway.sh",
+    "dev:app": "pnpm --filter openclaw-voice-pwa dev",
     "build": "pnpm run build:app && pnpm run build:plugin",
     "build:app": "pnpm --filter openclaw-voice-pwa build && rm -rf webapp && cp -R app/dist webapp",
     "build:plugin": "rolldown --config rolldown.config.ts"
