@@ -9,7 +9,8 @@ terminator) in front of the gateway port and you're done.
 - App at `https://<host>/voice`, WebSocket back to `wss://<host>` — same origin.
 - Realtime voice config lives in the plugin's own config under
   `plugins.entries.sureclaw-voice.config.realtime` (provider, model, voice,
-  instructions, tool/consult policy, and an agent persona/context capsule).
+  instructions, tool/consult policy, an agent persona/context capsule, and a
+  fast-context recall tool).
 - The plugin does **no auth** — the gateway authenticates the WebSocket itself.
 
 ## Agent installation prompt
@@ -68,6 +69,17 @@ Everything is optional except a usable `realtime.provider` — without one,
             "maxChars": 6000
           },
 
+          // Fast context: exposes a `fast_context` tool the model can call for
+          // quick recall from memory and past sessions, answered with no agent
+          // run (see "Two consult tools" below). When disabled, only the full
+          // openclaw_agent_consult tool is offered.
+          "fastContext": {
+            "enabled": true,
+            "timeoutMs": 800,                  // deadline for the lookup
+            "maxResults": 3,                   // max snippets returned
+            "sources": ["memory", "sessions"]
+          },
+
           // Provider-specific config, keyed by provider id. The OpenAI realtime
           // provider also reads OPENAI_API_KEY from the environment.
           "providers": {
@@ -90,9 +102,16 @@ Everything is optional except a usable `realtime.provider` — without one,
 }
 ```
 
-> **Consult tuning.** For the browser path, the consult runs through the gateway's
-> core Talk handler, so `consultThinkingLevel` / `consultFastMode` are read from
-> the top-level **`talk`** section (e.g. `"talk": { "consultThinkingLevel": "low" }`),
+> **Two consult tools.** When `fastContext.enabled`, the voice model is given
+> two tools and chooses between them: **`fast_context`** — a bounded memory/
+> session lookup owned by this plugin (`browserVoice.consult`), answered with no
+> agent run; and **`openclaw_agent_consult`** — the full OpenClaw agent via the
+> gateway's core Talk consult. `fast_context` never escalates on its own; if it
+> finds nothing the model decides whether to then call `openclaw_agent_consult`.
+> When `fastContext` is disabled, only `openclaw_agent_consult` is exposed.
+>
+> The full consult's `consultThinkingLevel` / `consultFastMode` are read from the
+> top-level **`talk`** section (e.g. `"talk": { "consultThinkingLevel": "low" }`),
 > not from this plugin's `realtime` block.
 
 ## Authentication
