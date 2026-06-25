@@ -5,11 +5,30 @@ import { fileURLToPath } from "node:url";
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES, resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
-import { REALTIME_VOICE_AGENT_CONSULT_TOOL, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy } from "openclaw/plugin-sdk/realtime-voice";
+import { REALTIME_VOICE_AGENT_CONSULT_TOOL, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy, resolveRealtimeVoiceFastContextConsult } from "openclaw/plugin-sdk/realtime-voice";
 //#region index.ts
 const DEFAULT_AGENT_CONTEXT_MAX_CHARS = 6e3;
 const CF_TURN_API_TOKEN_ENV = "CF_TURN_API_TOKEN";
 const PLUGIN_ID = "sureclaw-voice";
+const REALTIME_FAST_CONTEXT_TOOL = {
+	type: "function",
+	name: "fast_context",
+	description: "Quickly look up the answer in OpenClaw's memory and past sessions without running the full agent. Use this for recall — things the user told you before or that were discussed earlier. If it returns nothing relevant and the request needs tools, actions, current state, or reasoning, then call openclaw_agent_consult.",
+	parameters: {
+		type: "object",
+		properties: {
+			question: {
+				type: "string",
+				description: "The concrete question or task to look up."
+			},
+			context: {
+				type: "string",
+				description: "Optional relevant context or transcript summary."
+			}
+		},
+		required: ["question"]
+	}
+};
 function resolveBrowserRealtimeConfig(cfg) {
 	const realtime = cfg.plugins?.entries?.[PLUGIN_ID]?.config?.realtime;
 	if (!realtime || realtime.enabled === false) return void 0;
@@ -90,6 +109,7 @@ const entry = definePluginEntry({
 				}
 				const consultPolicy = realtimeConfig.consultPolicy ?? "always";
 				const toolPolicy = consultPolicy === "never" ? "none" : resolveRealtimeVoiceAgentConsultToolPolicy(realtimeConfig.toolPolicy, "owner");
+				const fastContextEnabled = resolveFastContextConfig(realtimeConfig.fastContext).enabled;
 				const agentContextInstructions = await resolveAgentContext({
 					cfg,
 					realtimeConfig,
@@ -103,9 +123,10 @@ const entry = definePluginEntry({
 						instructions: realtimeConfig.instructions,
 						agentContextInstructions,
 						toolPolicy,
-						consultPolicy
+						consultPolicy,
+						fastContextEnabled
 					}),
-					tools: toolPolicy === "none" ? [] : [REALTIME_VOICE_AGENT_CONSULT_TOOL],
+					tools: toolPolicy === "none" ? [] : fastContextEnabled ? [REALTIME_VOICE_AGENT_CONSULT_TOOL, REALTIME_FAST_CONTEXT_TOOL] : [REALTIME_VOICE_AGENT_CONSULT_TOOL],
 					model: realtimeConfig.model,
 					voice: realtimeConfig.voice
 				});
@@ -119,6 +140,39 @@ const entry = definePluginEntry({
 					code: "UNAVAILABLE",
 					message: error instanceof Error ? error.message : String(error)
 				});
+			}
+		});
+		api.registerGatewayMethod("browserVoice.consult", async ({ params, respond, context }) => {
+			const typed = normalizeConsultParams(params);
+			if (!typed) {
+				respond(false, void 0, {
+					code: "INVALID_REQUEST",
+					message: "browserVoice.consult requires a string sessionKey"
+				});
+				return;
+			}
+			try {
+				const cfg = context.getRuntimeConfig();
+				const fastContext = resolveFastContextConfig(resolveBrowserRealtimeConfig(cfg)?.fastContext);
+				if (!fastContext.enabled) {
+					respond(true, { text: "Fast context lookup is not enabled." }, void 0);
+					return;
+				}
+				const result = await resolveRealtimeVoiceFastContextConsult({
+					cfg,
+					agentId: typed.agentId || "main",
+					sessionKey: typed.sessionKey,
+					config: {
+						...fastContext,
+						fallbackToConsult: false
+					},
+					args: typed.args,
+					logger: { debug: (message) => console.debug(`sureclaw-voice: fast context: ${message}`) }
+				});
+				respond(true, { text: result.handled ? result.result.text : "No relevant context found." }, void 0);
+			} catch (error) {
+				console.warn(`sureclaw-voice: fast context consult failed: ${error instanceof Error ? error.message : String(error)}`);
+				respond(true, { text: "Fast context lookup is currently unavailable." }, void 0);
 			}
 		});
 	}
@@ -277,6 +331,26 @@ function normalizeParams(value) {
 		agentId: (typeof params.agentId === "string" ? params.agentId.trim() : "") || "main"
 	};
 }
+function normalizeConsultParams(value) {
+	if (!value || typeof value !== "object") return void 0;
+	const params = value;
+	const sessionKey = typeof params.sessionKey === "string" ? params.sessionKey.trim() : "";
+	if (!sessionKey) return void 0;
+	return {
+		sessionKey,
+		agentId: (typeof params.agentId === "string" ? params.agentId.trim() : "") || "main",
+		args: params.args ?? {}
+	};
+}
+function resolveFastContextConfig(config) {
+	return {
+		enabled: config?.enabled ?? false,
+		timeoutMs: config?.timeoutMs ?? 800,
+		maxResults: config?.maxResults ?? 3,
+		sources: config?.sources ?? ["memory", "sessions"],
+		fallbackToConsult: config?.fallbackToConsult ?? false
+	};
+}
 async function resolveAgentContext(params) {
 	const agentId = params.agentId || "main";
 	const agentContext = params.realtimeConfig.agentContext;
@@ -356,6 +430,7 @@ function buildProviderConfigOverrides(realtimeConfig) {
 function buildRealtimeInstructions(params) {
 	const base = params.instructions ?? ["You are OpenClaw's voice interface.", "Keep spoken replies concise, natural, and suitable for a live voice call."].join("\n");
 	const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
+	const fastContextInstructions = params.fastContextEnabled && params.toolPolicy !== "none" ? "You have two tools: fast_context for quick recall from memory and past sessions, and openclaw_agent_consult for the full agent. Prefer fast_context for remembering things; if it returns nothing relevant and the request needs tools, actions, current state, or deeper reasoning, call openclaw_agent_consult." : void 0;
 	if (params.consultPolicy === "always") return [
 		base,
 		params.agentContextInstructions?.trim(),
@@ -367,12 +442,14 @@ function buildRealtimeInstructions(params) {
 		"Answer directly only for greetings, acknowledgements, brief latency tests, or filler while waiting.",
 		"While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as \"yeah\", \"mm-hmm\", \"got it\", or \"one sec\"; vary it and do not treat it as the final answer.",
 		"When OpenClaw sends an internal exact answer to speak, do not call tools. Say only that answer.",
+		fastContextInstructions,
 		consultPolicyInstructions
 	].filter(Boolean).join("\n\n");
 	return [
 		base,
 		params.agentContextInstructions?.trim(),
 		"While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as \"yeah\", \"mm-hmm\", \"got it\", or \"one sec\"; vary it and do not treat it as the final answer.",
+		fastContextInstructions,
 		consultPolicyInstructions
 	].filter(Boolean).join("\n\n");
 }

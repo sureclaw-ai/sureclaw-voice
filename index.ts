@@ -12,8 +12,11 @@ import {
 } from "openclaw/plugin-sdk/realtime-bootstrap-context";
 import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL,
+  type RealtimeVoiceFastContextConfig,
+  type RealtimeVoiceTool,
   resolveConfiguredRealtimeVoiceProvider,
   resolveRealtimeVoiceAgentConsultToolPolicy,
+  resolveRealtimeVoiceFastContextConsult,
 } from "openclaw/plugin-sdk/realtime-voice";
 
 type BrowserVoiceParams = {
@@ -32,6 +35,10 @@ type RealtimeVoiceConfig = {
   // policy handling in the browserVoice.create handler.
   consultPolicy?: string;
   toolPolicy?: string;
+  // Low-latency memory/session lookup tried before the full agent consult.
+  // Consumed by the browserVoice.consult gateway method. All fields optional;
+  // defaults mirror the host realtime config (disabled unless enabled:true).
+  fastContext?: Partial<RealtimeVoiceFastContextConfig>;
   // Legacy: a bare list of profile files folded into the realtime instructions.
   // Superseded by `agentContext`; still honored when `agentContext` is absent so
   // existing configs keep working. See resolveAgentContext.
@@ -110,6 +117,29 @@ type RuntimeConfig = {
 };
 
 const PLUGIN_ID = "sureclaw-voice";
+
+// Second model-facing tool, exposed alongside openclaw_agent_consult when
+// fastContext is enabled. The model calls this for quick recall (memory/past
+// sessions); it returns found context or a "nothing relevant" note and never
+// escalates on its own — the model decides whether to then call
+// openclaw_agent_consult. Served by the browserVoice.consult gateway method.
+const REALTIME_FAST_CONTEXT_TOOL: RealtimeVoiceTool = {
+  type: "function",
+  name: "fast_context",
+  description:
+    "Quickly look up the answer in OpenClaw's memory and past sessions without running the full agent. " +
+    "Use this for recall — things the user told you before or that were discussed earlier. " +
+    "If it returns nothing relevant and the request needs tools, actions, current state, or reasoning, " +
+    "then call openclaw_agent_consult.",
+  parameters: {
+    type: "object",
+    properties: {
+      question: { type: "string", description: "The concrete question or task to look up." },
+      context: { type: "string", description: "Optional relevant context or transcript summary." },
+    },
+    required: ["question"],
+  },
+};
 
 // Resolves the realtime voice config for the browser session from this plugin's
 // own config slot (plugins.entries.sureclaw-voice.config.realtime), the same
@@ -216,6 +246,9 @@ const entry = definePluginEntry({
           consultPolicy === "never"
             ? "none"
             : resolveRealtimeVoiceAgentConsultToolPolicy(realtimeConfig.toolPolicy, "owner");
+        // Expose the fast_context tool alongside the agent consult only when fast
+        // context is enabled (and the consult tool itself is exposed).
+        const fastContextEnabled = resolveFastContextConfig(realtimeConfig.fastContext).enabled;
         const agentContextInstructions = await resolveAgentContext({
           cfg,
           realtimeConfig,
@@ -231,8 +264,14 @@ const entry = definePluginEntry({
             agentContextInstructions,
             toolPolicy,
             consultPolicy,
+            fastContextEnabled,
           }),
-          tools: toolPolicy === "none" ? [] : [REALTIME_VOICE_AGENT_CONSULT_TOOL],
+          tools:
+            toolPolicy === "none"
+              ? []
+              : fastContextEnabled
+                ? [REALTIME_VOICE_AGENT_CONSULT_TOOL, REALTIME_FAST_CONTEXT_TOOL]
+                : [REALTIME_VOICE_AGENT_CONSULT_TOOL],
           model: realtimeConfig.model,
           voice: realtimeConfig.voice,
         });
@@ -244,6 +283,59 @@ const entry = definePluginEntry({
           code: "UNAVAILABLE",
           message: error instanceof Error ? error.message : String(error),
         });
+      }
+    });
+
+    // Serves the model-facing fast_context tool: a bounded memory/session lookup
+    // owned by this plugin's config slot. Always returns speakable text (found
+    // context, or a "nothing relevant" note) so the model can decide whether to
+    // then call openclaw_agent_consult. It never runs the full agent itself —
+    // that stays on the core consult path (running an embedded agent needs a
+    // runtime the plugin SDK does not expose).
+    api.registerGatewayMethod("browserVoice.consult", async ({ params, respond, context }) => {
+      const typed = normalizeConsultParams(params);
+      if (!typed) {
+        respond(false, undefined, {
+          code: "INVALID_REQUEST",
+          message: "browserVoice.consult requires a string sessionKey",
+        });
+        return;
+      }
+
+      try {
+        const cfg = context.getRuntimeConfig() as RuntimeConfig;
+        const realtimeConfig = resolveBrowserRealtimeConfig(cfg);
+        const fastContext = resolveFastContextConfig(realtimeConfig?.fastContext);
+        if (!fastContext.enabled) {
+          respond(true, { text: "Fast context lookup is not enabled." }, undefined);
+          return;
+        }
+
+        const result = await resolveRealtimeVoiceFastContextConsult({
+          cfg,
+          agentId: typed.agentId || "main",
+          sessionKey: typed.sessionKey,
+          // Force fallbackToConsult:false so a miss returns speakable "nothing
+          // found" text rather than a silent fall-through — escalation to the
+          // full agent is the model's call (it has its own tool for that).
+          config: { ...fastContext, fallbackToConsult: false },
+          args: typed.args,
+          logger: { debug: (message) => console.debug(`sureclaw-voice: fast context: ${message}`) },
+        });
+
+        respond(
+          true,
+          { text: result.handled ? result.result.text : "No relevant context found." },
+          undefined,
+        );
+      } catch (error) {
+        // Fail soft: a fast-context error should never break the call.
+        console.warn(
+          `sureclaw-voice: fast context consult failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        respond(true, { text: "Fast context lookup is currently unavailable." }, undefined);
       }
     });
   },
@@ -532,6 +624,32 @@ function normalizeParams(value: unknown): BrowserVoiceParams | undefined {
   return { sessionKey, agentId: agentId || "main" };
 }
 
+type BrowserConsultParams = { sessionKey: string; agentId: string; args: unknown };
+
+function normalizeConsultParams(value: unknown): BrowserConsultParams | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const params = value as Record<string, unknown>;
+  const sessionKey = typeof params.sessionKey === "string" ? params.sessionKey.trim() : "";
+  if (!sessionKey) return undefined;
+  const agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
+  return { sessionKey, agentId: agentId || "main", args: params.args ?? {} };
+}
+
+// Fills a (partial) fastContext config with the host's defaults so the raw SDK
+// lookup receives a complete config (it reads these fields directly, without
+// the schema layer that would otherwise apply defaults). Disabled by default.
+function resolveFastContextConfig(
+  config?: Partial<RealtimeVoiceFastContextConfig>,
+): RealtimeVoiceFastContextConfig {
+  return {
+    enabled: config?.enabled ?? false,
+    timeoutMs: config?.timeoutMs ?? 800,
+    maxResults: config?.maxResults ?? 3,
+    sources: config?.sources ?? ["memory", "sessions"],
+    fallbackToConsult: config?.fallbackToConsult ?? false,
+  };
+}
+
 // Builds the agent-context capsule appended to realtime voice instructions.
 // Prefers the structured `agentContext` block (identity fields + profile files,
 // opt-in via `enabled`); falls back to the legacy `bootstrapContextFiles` list
@@ -668,6 +786,7 @@ function buildRealtimeInstructions(params: {
   agentContextInstructions?: string;
   toolPolicy: string;
   consultPolicy: string;
+  fastContextEnabled?: boolean;
 }) {
   const base =
     params.instructions ??
@@ -675,6 +794,14 @@ function buildRealtimeInstructions(params: {
       "\n",
     );
   const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
+  // Only describe fast_context when it is actually exposed as a tool.
+  const fastContextInstructions =
+    params.fastContextEnabled && params.toolPolicy !== "none"
+      ? "You have two tools: fast_context for quick recall from memory and past sessions, and " +
+        "openclaw_agent_consult for the full agent. Prefer fast_context for remembering things; " +
+        "if it returns nothing relevant and the request needs tools, actions, current state, or " +
+        "deeper reasoning, call openclaw_agent_consult."
+      : undefined;
 
   // "always" consult => present as a full OpenClaw agent proxy.
   if (params.consultPolicy === "always") {
@@ -689,6 +816,7 @@ function buildRealtimeInstructions(params: {
       "Answer directly only for greetings, acknowledgements, brief latency tests, or filler while waiting.",
       'While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as "yeah", "mm-hmm", "got it", or "one sec"; vary it and do not treat it as the final answer.',
       "When OpenClaw sends an internal exact answer to speak, do not call tools. Say only that answer.",
+      fastContextInstructions,
       consultPolicyInstructions,
     ]
       .filter(Boolean)
@@ -699,6 +827,7 @@ function buildRealtimeInstructions(params: {
     base,
     params.agentContextInstructions?.trim(),
     'While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as "yeah", "mm-hmm", "got it", or "one sec"; vary it and do not treat it as the final answer.',
+    fastContextInstructions,
     consultPolicyInstructions,
   ]
     .filter(Boolean)

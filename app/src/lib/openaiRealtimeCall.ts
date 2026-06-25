@@ -363,22 +363,31 @@ export class OpenAIRealtimeCall {
     const name = buffered?.name || stringField(event, "name") || "";
     const callId = buffered?.callId || stringField(event, "call_id") || "";
     const args = buffered?.args || stringField(event, "arguments") || "{}";
-    if (!callId || name !== "openclaw_agent_consult") return;
+    // Two model-facing tools: a quick memory/session lookup, and the full
+    // OpenClaw agent. The model picks; we route by name.
+    const isFastContext = name === "fast_context";
+    const isAgentConsult = name === "openclaw_agent_consult";
+    if (!callId || (!isFastContext && !isAgentConsult)) return;
 
-    this.callbacks.onStatus("thinking", "Working on that, this might take a while...");
-    this.callbacks.onLog("Forwarding realtime tool call to OpenClaw");
-    // The consult can take several seconds. Server VAD ships with
-    // create_response/interrupt_response enabled, so without this the model
-    // would spontaneously answer (or get cut off) on any stray audio while we
-    // wait, talking over the eventual tool result. Suspend auto turn-taking for
-    // the duration and restore it once the post-tool answer is delivered.
+    this.callbacks.onStatus(
+      "thinking",
+      isFastContext ? "Checking memory…" : "Working on that, this might take a while...",
+    );
+    this.callbacks.onLog(`Handling realtime tool call: ${name}`);
+    // Either tool can take a moment (the agent consult, seconds). Server VAD
+    // ships with create_response/interrupt_response enabled, so without this the
+    // model would spontaneously answer (or get cut off) on any stray audio while
+    // we wait, talking over the eventual tool result. Suspend auto turn-taking
+    // for the duration and restore it once the post-tool answer is delivered.
     this.toolCallsInFlight += 1;
     this.suspendTurnDetection();
     const controller = new AbortController();
     this.abortControllers.add(controller);
 
     try {
-      const result = await this.runOpenClawConsult(callId, args, controller.signal);
+      const result = isFastContext
+        ? await this.runFastContext(args)
+        : await this.runAgentConsult(callId, args, controller.signal);
       this.submitToolResult(callId, { result });
     } catch (error) {
       this.submitToolResult(callId, {
@@ -442,7 +451,29 @@ export class OpenAIRealtimeCall {
     this.callbacks.onLog("Resumed auto turn-taking");
   }
 
-  private async runOpenClawConsult(callId: string, rawArgs: string, signal: AbortSignal) {
+  // fast_context tool: a quick memory/session lookup owned by the plugin. Always
+  // returns speakable text (the found context, or a "nothing relevant" note) so
+  // the model can decide whether to then call openclaw_agent_consult. Never
+  // escalates on its own — that choice belongs to the model.
+  private async runFastContext(rawArgs: string) {
+    const args = safeJson(rawArgs);
+    console.debug(`${LOG_PREFIX} fast_context → gateway browserVoice.consult`, {
+      sessionKey: this.sessionKey,
+      args,
+    });
+    const response = (await this.gateway.request("browserVoice.consult", {
+      sessionKey: this.sessionKey,
+      agentId: "main",
+      args,
+    })) as { text?: string };
+    this.callbacks.onLog("fast_context lookup complete");
+    return typeof response.text === "string" ? response.text : "No relevant context found.";
+  }
+
+  // openclaw_agent_consult tool: the full OpenClaw agent run via the gateway's
+  // core Talk consult. No fast-context pre-check — if the model wanted the quick
+  // lookup it would have called fast_context.
+  private async runAgentConsult(callId: string, rawArgs: string, signal: AbortSignal) {
     const args = safeJson(rawArgs);
     console.debug(`${LOG_PREFIX} consult → gateway talk.client.toolCall`, {
       sessionKey: this.sessionKey,
