@@ -1,6 +1,12 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Phone, PhoneOff, RotateCcw, Settings, X } from "lucide-react";
-import type { CallStatus, GatewaySettings, RealtimeBrowserSession, TranscriptEntry } from "./types";
+import type {
+  CallStatus,
+  GatewayEvent,
+  GatewaySettings,
+  RealtimeBrowserSession,
+  TranscriptEntry,
+} from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
 import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
 import { callSounds } from "./lib/callSounds";
@@ -66,6 +72,33 @@ function log(line: string) {
   console.log(`[voice] ${new Date().toLocaleTimeString()} ${line}`);
 }
 
+// The PWA subscribes to the gateway's `tool-events` cap so a future UI can
+// surface the agent's tool activity. During a substantive `openclaw_agent_consult`
+// that firehose carries dozens of large `agent` frames in seconds — including raw
+// exec output and full session-transcript dumps. Passing those payload objects
+// straight to `console.debug` makes DevTools retain and serialize each one, which
+// saturates the main thread and freezes the tab mid-call. Log a compact one-line
+// summary for the high-volume `agent` stream and keep full payloads only for the
+// bounded lifecycle events. Set `window.__voiceDebugToolEvents = true` to opt back
+// into full agent payloads when inspecting a specific tool call.
+function logGatewayEvent(event: GatewayEvent) {
+  if (event.event !== "agent") {
+    console.debug(`[gateway] event: ${event.event}`, event.payload);
+    return;
+  }
+  const verbose = (globalThis as { __voiceDebugToolEvents?: boolean }).__voiceDebugToolEvents;
+  if (verbose) {
+    console.debug(`[gateway] event: agent`, event.payload);
+    return;
+  }
+  const data = event.payload as { stream?: unknown; data?: { name?: unknown } } | undefined;
+  const stream = typeof data?.stream === "string" ? data.stream : "?";
+  const tool = typeof data?.data?.name === "string" ? ` tool=${data.data.name}` : "";
+  const seq = typeof event.seq === "number" ? ` seq=${event.seq}` : "";
+  // String-only log: nothing large is retained by the console.
+  console.debug(`[gateway] event: agent stream=${stream}${tool}${seq}`);
+}
+
 function describeStatus(status: CallStatus): string {
   if (status === "idle") return "Ready to call";
   if (status === "connecting") return "Connecting…";
@@ -114,6 +147,15 @@ export default function App() {
     [],
   );
   const [muted, setMuted] = useState(false);
+  // Whether the assistant's audio is actually playing out the speakers right
+  // now (tracked from the WebRTC output-buffer lifecycle, not the data-channel
+  // events that race ahead of playback). Used to hold call cues until the model
+  // has finished speaking.
+  const [speaking, setSpeaking] = useState(false);
+  // Whether a full OpenClaw agent consult is in flight — the long dead-air wait
+  // the pending pulse fills. Tracked separately from the status detail, which
+  // now shows live tool activity ("Running bash…") rather than a fixed string.
+  const [consulting, setConsulting] = useState(false);
   const gatewayRef = useRef<GatewayClient | null>(null);
   const callRef = useRef<OpenAIRealtimeCall | null>(null);
   // Whether the user currently intends to be in a call. Guards against a late
@@ -173,11 +215,21 @@ export default function App() {
       settings.secret.trim(),
     );
     gatewayRef.current = gateway;
-    gateway.addEventListener((event) =>
-      console.debug(`[gateway] event: ${event.event}`, event.payload),
-    );
+    gateway.addEventListener((event) => logGatewayEvent(event));
     await gateway.connect();
     log("Gateway connected");
+
+    // Subscribe to session events so the gateway streams this session's tool
+    // activity to us as `session.tool` events during an agent consult. The
+    // `tool-events` connect cap alone only delivers tool frames to runs we are
+    // registered as a recipient of, which the browser Talk consult path is not —
+    // so without this the consult status can't show what the agent is running.
+    try {
+      await gateway.request("sessions.subscribe", {});
+      log("Subscribed to session events");
+    } catch (error) {
+      log(`Session-event subscribe failed (tool activity may be hidden): ${String(error)}`);
+    }
 
     const sessionKey = await resolveSessionKey(gateway, settings.sessionKey);
     if (sessionKey !== settings.sessionKey) updateSettings({ sessionKey });
@@ -208,6 +260,8 @@ export default function App() {
         console.debug(`[transcript] ${entry.role}: ${entry.text}`),
       onLog: log,
       onStream: addStream,
+      onSpeaking: setSpeaking,
+      onConsulting: setConsulting,
       // A fatal WebRTC loss does NOT silently reconnect — it surfaces an error
       // screen so the drop is visible and the user decides whether to redial.
       onConnectionLost: (state) => {
@@ -328,11 +382,13 @@ export default function App() {
   // pulse — same theme as the other call cues — and kill it the moment the
   // consult resolves or the call leaves the consult state.
   useEffect(() => {
-    const consulting =
-      status === "thinking" && detail === "Working on that, this might take a while...";
-    if (consulting) callSounds.startPending();
+    // Hold the pending pulse until the model has actually stopped speaking — the
+    // consult begins the moment the tool call lands on the data channel, which is
+    // typically while the model's lead-in ("Let me look into that…") is still
+    // playing out the speakers. Starting the cue then would talk over it.
+    if (consulting && !speaking) callSounds.startPending();
     else callSounds.stopPending();
-  }, [status, detail]);
+  }, [consulting, speaking]);
 
   useEffect(() => {
     if (!showSettings) return;

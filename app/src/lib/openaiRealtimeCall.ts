@@ -50,6 +50,20 @@ type CallCallbacks = {
    * the grace window). The orchestrator can use this to re-mint and re-dial.
    */
   onConnectionLost: (state: string) => void;
+  /**
+   * Fired when the assistant's audio output actually starts/stops playing out
+   * the speakers (the WebRTC `output_audio_buffer` lifecycle), as opposed to
+   * the data-channel events that arrive ahead of playback. Lets the UI hold the
+   * "thinking" cue until the model has genuinely finished speaking.
+   */
+  onSpeaking?: (speaking: boolean) => void;
+  /**
+   * Fired around a full OpenClaw agent consult (not the quick fast_context
+   * lookup): `true` while one is in flight, `false` once all have resolved.
+   * Marks the long dead-air stretch the pending pulse fills — decoupled from
+   * the status detail, which now reflects live tool activity.
+   */
+  onConsulting?: (active: boolean) => void;
 };
 
 // Public STUN fallback used when the Gateway does not supply its own ICE
@@ -93,6 +107,13 @@ export class OpenAIRealtimeCall {
   private abortControllers = new Set<AbortController>();
   private recoveryTimer: number | null = null;
   private toolCallsInFlight = 0;
+  // Agent consults specifically (not the quick fast_context lookup): these are
+  // the long, dead-air waits the pending cue fills, so they gate onConsulting.
+  private agentConsultsInFlight = 0;
+  // The latest human-readable consult activity ("Working on it…", "Running
+  // bash…"), held so a `response.done` that lands mid-consult re-asserts the
+  // live tool detail instead of clobbering it with a generic string.
+  private consultDetail = "";
   private turnDetectionSuspended = false;
 
   constructor(
@@ -297,6 +318,17 @@ export class OpenAIRealtimeCall {
       case "input_audio_buffer.speech_stopped":
         this.callbacks.onStatus("thinking", "Processing speech");
         return;
+      // The assistant's audio output buffer actually begins/finishes playing out
+      // the speakers. These trail the data-channel response events (which arrive
+      // while audio is still queued), so they are the truthful "is the model
+      // speaking right now" signal the UI uses to time its cues.
+      case "output_audio_buffer.started":
+        this.callbacks.onSpeaking?.(true);
+        return;
+      case "output_audio_buffer.stopped":
+      case "output_audio_buffer.cleared":
+        this.callbacks.onSpeaking?.(false);
+        return;
       case "response.created":
         this.responseActive = true;
         this.responseCreateInFlight = false;
@@ -309,11 +341,12 @@ export class OpenAIRealtimeCall {
         // The response that carried a function call completes (response.done)
         // while the consult it triggered is still running. Don't flip back to
         // "listening" yet — that would clear the pending consult cue mid-flight,
-        // leaving the line dead silent. Hold the pending state until the consult
-        // resolves and its answer starts generating.
+        // leaving the line dead silent. Hold the thinking state and re-assert the
+        // live consult detail (the latest tool the agent is running) until the
+        // consult resolves and its answer starts generating.
         this.callbacks.onStatus(
           this.toolCallsInFlight > 0 ? "thinking" : "listening",
-          this.toolCallsInFlight > 0 ? "Working on that, this might take a while..." : "",
+          this.toolCallsInFlight > 0 ? this.consultDetail || "Working on it…" : "",
         );
         this.flushPendingResponseCreate();
         this.maybeResumeTurnDetection();
@@ -369,11 +402,15 @@ export class OpenAIRealtimeCall {
     const isAgentConsult = name === "openclaw_agent_consult";
     if (!callId || (!isFastContext && !isAgentConsult)) return;
 
-    this.callbacks.onStatus(
-      "thinking",
-      isFastContext ? "Checking memory…" : "Working on that, this might take a while...",
-    );
+    this.consultDetail = isFastContext ? "Checking memory…" : "Working on it…";
+    this.callbacks.onStatus("thinking", this.consultDetail);
     this.callbacks.onLog(`Handling realtime tool call: ${name}`);
+    // Only the full agent consult is a long dead-air wait worth the pending
+    // pulse; fast_context is a quick lookup. Gate the cue on the consult count.
+    if (isAgentConsult) {
+      this.agentConsultsInFlight += 1;
+      if (this.agentConsultsInFlight === 1) this.callbacks.onConsulting?.(true);
+    }
     // Either tool can take a moment (the agent consult, seconds). Server VAD
     // ships with create_response/interrupt_response enabled, so without this the
     // model would spontaneously answer (or get cut off) on any stray audio while
@@ -396,6 +433,11 @@ export class OpenAIRealtimeCall {
     } finally {
       this.abortControllers.delete(controller);
       this.toolCallsInFlight -= 1;
+      if (this.toolCallsInFlight === 0) this.consultDetail = "";
+      if (isAgentConsult) {
+        this.agentConsultsInFlight -= 1;
+        if (this.agentConsultsInFlight === 0) this.callbacks.onConsulting?.(false);
+      }
     }
   }
 
@@ -496,6 +538,15 @@ export class OpenAIRealtimeCall {
 
   private waitForChatFinal(runId: string, signal: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
+      // TEMP diagnostic: tally every gateway event the consult observes so we
+      // can see (at console.log level, since debug is often hidden) whether the
+      // agent's `tool` stream actually reaches this client and under what runId.
+      const eventTally = new Map<string, number>();
+      const toolNames = new Set<string>();
+      const agentRunIds = new Set<string>();
+      // First-seen shape per event kind, so we can tell whether tool calls are
+      // hiding inside assistant/item frames rather than a dedicated tool stream.
+      const shapeByKey = new Map<string, string>();
       const timeout = window.setTimeout(() => {
         console.warn(
           `${LOG_PREFIX} consult TIMEOUT after 120s (runId=${runId}) — no chat 'final' event arrived`,
@@ -505,6 +556,28 @@ export class OpenAIRealtimeCall {
       const abort = () =>
         cleanup(() => reject(new DOMException("OpenClaw consult aborted", "AbortError")));
       const unsubscribe = this.gateway.addEventListener((event: GatewayEvent) => {
+        const p = (event.payload ?? {}) as { stream?: unknown; runId?: unknown; data?: unknown };
+        const tallyKey =
+          event.event === "agent" && typeof p.stream === "string"
+            ? `agent:${p.stream}`
+            : event.event;
+        eventTally.set(tallyKey, (eventTally.get(tallyKey) ?? 0) + 1);
+        if (event.event === "agent" && typeof p.runId === "string") agentRunIds.add(p.runId);
+        if (!shapeByKey.has(tallyKey)) {
+          const d = p.data;
+          const dataKeys =
+            d && typeof d === "object" ? Object.keys(d as Record<string, unknown>).join("|") : typeof d;
+          shapeByKey.set(tallyKey, `{${dataKeys}}`);
+        }
+        // The agent streams its tool activity as `session.tool` events (to
+        // session-event subscribers) and, for runs we're a registered recipient
+        // of, as `agent` events with stream "tool". Surface whichever arrives so
+        // the caller sees "Running bash…" instead of a generic wait.
+        if (event.event === "session.tool" || event.event === "agent") {
+          const toolName = this.noteConsultToolActivity(runId, event.payload);
+          if (toolName) toolNames.add(toolName);
+          return;
+        }
         if (event.event !== "chat") return;
         const payload = event.payload;
         if (!payload || typeof payload !== "object") return;
@@ -535,9 +608,41 @@ export class OpenAIRealtimeCall {
         window.clearTimeout(timeout);
         signal.removeEventListener("abort", abort);
         unsubscribe();
+        // TEMP diagnostic summary (visible at console.log level).
+        console.log(
+          `${LOG_PREFIX} consult summary: events=${JSON.stringify(Object.fromEntries(eventTally))} shapes=${JSON.stringify(Object.fromEntries(shapeByKey))} tools=[${[...toolNames].join(", ")}] agentRunIds=[${[...agentRunIds].join(", ")}] consultRunId=${runId}`,
+        );
         finish();
       };
     });
+  }
+
+  // Translate an `agent` tool-stream event into the live consult status detail.
+  // The gateway broadcasts `{ runId, stream: "tool", data: { name, phase } }`,
+  // and delivery is already scoped to this run's tool-event recipients — so any
+  // tool frame that reaches us belongs to our consult even if the agent run's id
+  // differs from the `talk-…` consult handle we hold (it routes events through
+  // `eventRunId = chatLink.clientRunId ?? evt.runId`). We therefore track the
+  // latest named tool rather than dropping on a runId mismatch; a mismatch is
+  // logged once so the real id relationship stays visible.
+  private noteConsultToolActivity(runId: string, payload: unknown): string | undefined {
+    if (!payload || typeof payload !== "object") return undefined;
+    const agentEvent = payload as {
+      runId?: string;
+      stream?: string;
+      data?: { name?: unknown; phase?: unknown };
+    };
+    if (agentEvent.stream !== "tool") return undefined;
+    const toolName = typeof agentEvent.data?.name === "string" ? agentEvent.data.name : "";
+    if (!toolName) return undefined;
+    if (agentEvent.runId !== runId)
+      console.debug(
+        `${LOG_PREFIX} consult tool event runId ${agentEvent.runId} ≠ consult ${runId} — surfacing anyway (run-scoped delivery)`,
+      );
+    const detail = `Running ${humanizeToolName(toolName)}…`;
+    this.consultDetail = detail;
+    this.callbacks.onStatus("thinking", detail);
+    return toolName;
   }
 
   private submitToolResult(callId: string, result: unknown) {
@@ -578,6 +683,18 @@ export class OpenAIRealtimeCall {
       "Realtime provider error"
     );
   }
+}
+
+// Turn a raw agent tool id ("read_file", "webSearch", "bash") into something
+// speakable for the status line ("read file", "web search", "bash"). Splits
+// snake/kebab/camelCase and lowercases; falls back to a neutral word if empty.
+function humanizeToolName(name: string): string {
+  const spaced = name
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim()
+    .toLowerCase();
+  return spaced || "a tool";
 }
 
 function stringField(record: Record<string, unknown>, key: string) {

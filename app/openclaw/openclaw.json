@@ -22,22 +22,35 @@
       "sureclaw-voice": {
         "enabled": true,
         "config": {
-          "webapp": {
-            "enabled": true,
-            "path": "/voice",
-            "name": "SureClaw Voice"
-          },
           "realtime": {
+            "enabled": true,
             "provider": "openai",
-            "consultPolicy": "always",
+            "model": "gpt-realtime-2",
+            "voice": "alloy",
             "toolPolicy": "owner",
+            "consultPolicy": "always",
+            "agentContext": {
+              "enabled": true,
+              "includeIdentity": true,
+              "includeWorkspaceFiles": true,
+              "files": ["SOUL.md", "IDENTITY.md", "USER.md"],
+              "maxChars": 6000
+            },
+            "fastContext": {
+              "enabled": true,
+              "timeoutMs": 800,
+              "maxResults": 3,
+              "sources": ["memory", "sessions"]
+            },
             "providers": {
               "openai": {
-                "apiKey": "${OPENAI_API_KEY}",
-                "model": "gpt-realtime-2",
-                "voice": "verse"
+                "apiKey": "${OPENAI_API_KEY}"
               }
             }
+          },
+          "webapp": {
+            "path": "/voice",
+            "name": "SureClaw Voice"
           }
         }
       }

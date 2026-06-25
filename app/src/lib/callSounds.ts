@@ -107,12 +107,16 @@ class CallSounds {
     this.unlock();
     if (this.pendingTimer !== null) return; // already pending
     const pulse = () => {
-      // A gentle rising fifth (C5 → G5) with a long tail — soft, open, patient.
-      this.tone(NOTE.C5, 0, 0.34, { gain: 0.55 });
-      this.tone(NOTE.G5, 0.18, 0.5, { gain: 0.45 });
+      // "BUM bum bum bum" — one low note (C4) struck four times, each hit
+      // quieter than the last, then a long pause before it repeats. Soft and
+      // patient; reads as contemplation, not alerting.
+      this.tone(NOTE.C4, 0, 0.3, { gain: 0.95 });
+      this.tone(NOTE.C4, 0.5, 0.3, { gain: 0.6 });
+      this.tone(NOTE.C4, 1.0, 0.3, { gain: 0.38 });
+      this.tone(NOTE.C4, 1.5, 0.3, { gain: 0.24 });
     };
     pulse();
-    this.pendingTimer = window.setInterval(pulse, 2400);
+    this.pendingTimer = window.setInterval(pulse, 3700);
   }
 
   stopPending() {
