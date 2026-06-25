@@ -9,7 +9,7 @@ importers:
   .:
     devDependencies:
       openclaw:
-        specifier: ^2026.5.27
+        specifier: ^2026.6.8
         version: 2026.6.9
       rolldown:
         specifier: ^1.1.2

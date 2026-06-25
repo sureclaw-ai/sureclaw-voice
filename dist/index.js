@@ -67,7 +67,9 @@ const entry = definePluginEntry({
 			},
 			realtime: {
 				type: "object",
-				additionalProperties: true
+				additionalProperties: true,
+				required: ["model"],
+				properties: { model: { type: "string" } }
 			}
 		}
 	},

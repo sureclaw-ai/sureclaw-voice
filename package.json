@@ -12,10 +12,10 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.27"
+      "pluginApi": ">=2026.6.8"
     },
     "install": {
-      "minHostVersion": ">=2026.5.27"
+      "minHostVersion": ">=2026.6.8"
     }
   },
   "scripts": {
@@ -27,7 +27,7 @@
     "build:plugin": "rolldown --config rolldown.config.ts"
   },
   "devDependencies": {
-    "openclaw": "^2026.5.27",
+    "openclaw": "^2026.6.8",
     "rolldown": "^1.1.2",
     "typescript": "^6.0.3"
   }

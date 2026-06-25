@@ -152,6 +152,7 @@ in). Don't make the operator decide on any of the rest; just set it.
         "realtime": {
           "enabled": true,
           "provider": "openai",
+          "model": "gpt-realtime-2",   // realtime model
           "voice": "alloy",            // ← the voice the operator picked
           "consultPolicy": "always",   // full OpenClaw agent proxy — delegate everything
           "toolPolicy": "owner",

@@ -187,10 +187,16 @@ const entry = definePluginEntry({
         },
       },
       // Realtime voice config (provider, model, voice, instructions, tool/consult
-      // policy, etc.). Loosely validated — provider-specific keys vary by provider.
+      // policy, etc.). Loosely validated — provider-specific keys vary by provider
+      // — but `model` is required: there is no provider-side default realtime
+      // model, so an omitted model mints a session against an undefined model.
       realtime: {
         type: "object",
         additionalProperties: true,
+        required: ["model"],
+        properties: {
+          model: { type: "string" },
+        },
       },
     },
   },
