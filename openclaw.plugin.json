@@ -20,8 +20,6 @@
             "additionalProperties": false,
             "properties": {
               "keyId": { "type": "string" },
-              "apiToken": { "type": "string" },
-              "apiTokenEnv": { "type": "string" },
               "ttlSeconds": { "type": "number" }
             }
           }
@@ -31,12 +29,11 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "path": { "type": "string" },
-          "dir": { "type": "string" },
+          "path": { "type": "string", "description": "Mount path for the voice PWA (default \"/voice\"). The plugin always serves the bundled assets; serving cannot be disabled." },
           "name": { "type": "string", "description": "Display name shown in the page title, manifest, and the Call button. Default: OpenClaw." }
         }
-      }
+      },
+      "realtime": { "type": "object", "additionalProperties": true }
     }
   }
 }

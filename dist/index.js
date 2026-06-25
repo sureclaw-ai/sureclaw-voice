@@ -2,19 +2,18 @@ import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
+import { REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES, resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
 import { REALTIME_VOICE_AGENT_CONSULT_TOOL, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy } from "openclaw/plugin-sdk/realtime-voice";
 //#region index.ts
+const DEFAULT_AGENT_CONTEXT_MAX_CHARS = 6e3;
+const CF_TURN_API_TOKEN_ENV = "CF_TURN_API_TOKEN";
 const PLUGIN_ID = "sureclaw-voice";
 function resolveBrowserRealtimeConfig(cfg) {
-	const config = cfg.plugins?.entries?.[PLUGIN_ID]?.config;
-	const realtime = config?.realtime;
+	const realtime = cfg.plugins?.entries?.[PLUGIN_ID]?.config?.realtime;
 	if (!realtime || realtime.enabled === false) return void 0;
-	return {
-		realtimeConfig: realtime,
-		mode: normalizeVoiceMode(config?.mode ?? realtime.mode)
-	};
+	return realtime;
 }
 const entry = definePluginEntry({
 	id: "sureclaw-voice",
@@ -34,8 +33,6 @@ const entry = definePluginEntry({
 						additionalProperties: false,
 						properties: {
 							keyId: { type: "string" },
-							apiToken: { type: "string" },
-							apiTokenEnv: { type: "string" },
 							ttlSeconds: { type: "number" }
 						}
 					}
@@ -45,19 +42,9 @@ const entry = definePluginEntry({
 				type: "object",
 				additionalProperties: false,
 				properties: {
-					enabled: { type: "boolean" },
 					path: { type: "string" },
-					dir: { type: "string" },
 					name: { type: "string" }
 				}
-			},
-			mode: {
-				type: "string",
-				enum: [
-					"agent-proxy",
-					"stt-tts",
-					"bidi"
-				]
 			},
 			realtime: {
 				type: "object",
@@ -78,15 +65,14 @@ const entry = definePluginEntry({
 			}
 			try {
 				const cfg = context.getRuntimeConfig();
-				const resolved = resolveBrowserRealtimeConfig(cfg);
-				if (!resolved) {
+				const realtimeConfig = resolveBrowserRealtimeConfig(cfg);
+				if (!realtimeConfig) {
 					respond(false, void 0, {
 						code: "UNAVAILABLE",
 						message: "No realtime voice config found — configure plugins.entries.sureclaw-voice.config.realtime"
 					});
 					return;
 				}
-				const realtimeConfig = resolved.realtimeConfig;
 				const resolution = resolveConfiguredRealtimeVoiceProvider({
 					configuredProviderId: realtimeConfig.provider,
 					providerConfigs: buildProviderConfigs(realtimeConfig),
@@ -102,10 +88,9 @@ const entry = definePluginEntry({
 					});
 					return;
 				}
-				const mode = resolved.mode;
-				const toolPolicy = resolveRealtimeVoiceAgentConsultToolPolicy(realtimeConfig.toolPolicy, mode === "agent-proxy" ? "owner" : "safe-read-only");
-				const consultPolicy = realtimeConfig.consultPolicy ?? (mode === "agent-proxy" ? "always" : "auto");
-				const bootstrapContextInstructions = await resolveBootstrapContext({
+				const consultPolicy = realtimeConfig.consultPolicy ?? "always";
+				const toolPolicy = consultPolicy === "never" ? "none" : resolveRealtimeVoiceAgentConsultToolPolicy(realtimeConfig.toolPolicy, "owner");
+				const agentContextInstructions = await resolveAgentContext({
 					cfg,
 					realtimeConfig,
 					sessionKey: typedParams.sessionKey,
@@ -115,9 +100,8 @@ const entry = definePluginEntry({
 					cfg,
 					providerConfig: resolution.providerConfig,
 					instructions: buildRealtimeInstructions({
-						mode,
 						instructions: realtimeConfig.instructions,
-						bootstrapContextInstructions,
+						agentContextInstructions,
 						toolPolicy,
 						consultPolicy
 					}),
@@ -160,10 +144,9 @@ const WEBAPP_CONTENT_TYPES = {
 const TOKENIZED_EXTENSIONS = /* @__PURE__ */ new Set([".html", ".webmanifest"]);
 function registerWebappRoute(api) {
 	const webapp = api.pluginConfig?.webapp;
-	if (webapp?.enabled === false) return;
-	const dir = resolveWebappDir(webapp?.dir);
+	const dir = resolveWebappDir();
 	if (!dir) {
-		api.logger?.warn?.("sureclaw-voice: voice web app not served — no built assets found. Build the PWA and stage it into the plugin's webapp/ directory (npm run build), or set plugins.entries.sureclaw-voice.config.webapp.dir.");
+		api.logger?.warn?.("sureclaw-voice: voice web app not served — no built assets found. Build the PWA and stage it into the plugin's webapp/ directory (npm run build).");
 		return;
 	}
 	const configuredName = webapp?.name?.trim();
@@ -182,11 +165,7 @@ function registerWebappRoute(api) {
 	});
 	api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
 }
-function resolveWebappDir(configDir) {
-	if (configDir) {
-		const dir = resolve(configDir);
-		return existsSync(resolve(dir, "index.html")) ? dir : void 0;
-	}
+function resolveWebappDir() {
 	for (const rel of ["./webapp/", "../webapp/"]) {
 		const dir = fileURLToPath(new URL(rel, import.meta.url));
 		if (existsSync(resolve(dir, "index.html"))) return dir;
@@ -256,8 +235,8 @@ async function resolveIceServers(webrtc) {
 	if (Array.isArray(webrtc.iceServers)) servers.push(...webrtc.iceServers.filter((server) => Boolean(server?.urls)));
 	const cf = webrtc.cloudflareTurn;
 	if (cf?.keyId) {
-		const apiToken = cf.apiToken || (cf.apiTokenEnv ? readEnv(cf.apiTokenEnv) : void 0);
-		if (!apiToken) console.warn("sureclaw-voice: cloudflareTurn.keyId is set but no apiToken/apiTokenEnv resolved; skipping TURN.");
+		const apiToken = readEnv(CF_TURN_API_TOKEN_ENV);
+		if (!apiToken) console.warn(`sureclaw-voice: cloudflareTurn.keyId is set but ${CF_TURN_API_TOKEN_ENV} is not set; skipping TURN.`);
 		else try {
 			const generated = await generateCloudflareTurn(cf.keyId, apiToken, cf.ttlSeconds ?? 86400);
 			if (generated) servers.push(generated);
@@ -298,25 +277,69 @@ function normalizeParams(value) {
 		agentId: (typeof params.agentId === "string" ? params.agentId.trim() : "") || "main"
 	};
 }
-async function resolveBootstrapContext(params) {
-	const files = params.realtimeConfig.bootstrapContextFiles;
+async function resolveAgentContext(params) {
+	const agentId = params.agentId || "main";
+	const agentContext = params.realtimeConfig.agentContext;
+	if (!agentContext) return resolveProfileFileInstructions({
+		cfg: params.cfg,
+		agentId,
+		sessionKey: params.sessionKey,
+		files: params.realtimeConfig.bootstrapContextFiles
+	});
+	if (!agentContext.enabled) return void 0;
+	const maxChars = typeof agentContext.maxChars === "number" && agentContext.maxChars > 0 ? agentContext.maxChars : DEFAULT_AGENT_CONTEXT_MAX_CHARS;
+	const sections = [];
+	if (agentContext.includeIdentity !== false) {
+		const identity = buildIdentityCapsule(params.cfg, agentId);
+		if (identity) sections.push(identity);
+	}
+	if (agentContext.includeWorkspaceFiles !== false) {
+		const fileInstructions = await resolveProfileFileInstructions({
+			cfg: params.cfg,
+			agentId,
+			sessionKey: params.sessionKey,
+			files: agentContext.files
+		});
+		if (fileInstructions) sections.push(fileInstructions);
+	}
+	if (sections.length === 0) return void 0;
+	const capsule = sections.join("\n\n");
+	return capsule.length > maxChars ? `${capsule.slice(0, maxChars)}\n[truncated]` : capsule;
+}
+async function resolveProfileFileInstructions(params) {
+	const files = normalizeProfileFiles(params.files);
 	if (files?.length === 0) return void 0;
 	try {
 		return await resolveRealtimeBootstrapContextInstructions({
 			config: params.cfg,
-			agentId: params.agentId || "main",
+			agentId: params.agentId,
 			sessionKey: params.sessionKey,
 			files,
-			warn: (message) => console.warn(`sureclaw-voice: realtime bootstrap context: ${message}`)
+			warn: (message) => console.warn(`sureclaw-voice: realtime agent context: ${message}`)
 		});
 	} catch (error) {
-		console.warn(`sureclaw-voice: realtime bootstrap context unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		console.warn(`sureclaw-voice: realtime agent context unavailable: ${error instanceof Error ? error.message : String(error)}`);
 		return;
 	}
 }
-function normalizeVoiceMode(mode) {
-	if (mode === "stt-tts" || mode === "bidi") return mode;
-	return "agent-proxy";
+function normalizeProfileFiles(files) {
+	if (!files) return void 0;
+	const allowed = new Set(REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES);
+	const kept = files.filter((file) => allowed.has(file));
+	const dropped = files.filter((file) => !allowed.has(file));
+	if (dropped.length > 0) console.warn(`sureclaw-voice: realtime agent context ignoring unsupported files (${dropped.join(", ")}); allowed: ${REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES.join(", ")}`);
+	return kept;
+}
+function buildIdentityCapsule(cfg, agentId) {
+	const identity = resolveAgentIdentity(cfg, agentId);
+	if (!identity) return void 0;
+	const lines = [
+		identity.name ? `Name: ${identity.name}` : void 0,
+		identity.theme ? `Theme: ${identity.theme}` : void 0,
+		identity.emoji ? `Emoji: ${identity.emoji}` : void 0
+	].filter(Boolean);
+	if (lines.length === 0) return void 0;
+	return ["Agent identity (speak and act as this agent; do not read these lines aloud):", ...lines].join("\n");
 }
 function buildProviderConfigs(realtimeConfig) {
 	const configs = realtimeConfig.providers;
@@ -333,9 +356,9 @@ function buildProviderConfigOverrides(realtimeConfig) {
 function buildRealtimeInstructions(params) {
 	const base = params.instructions ?? ["You are OpenClaw's voice interface.", "Keep spoken replies concise, natural, and suitable for a live voice call."].join("\n");
 	const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
-	if (params.mode === "agent-proxy") return [
+	if (params.consultPolicy === "always") return [
 		base,
-		params.bootstrapContextInstructions?.trim(),
+		params.agentContextInstructions?.trim(),
 		"Mode: OpenClaw agent proxy.",
 		"You are the realtime voice surface for the same OpenClaw agent the user can message directly.",
 		"Do not mention a backend, supervisor, helper, or separate system. Present the result as your own work.",
@@ -348,12 +371,13 @@ function buildRealtimeInstructions(params) {
 	].filter(Boolean).join("\n\n");
 	return [
 		base,
-		params.bootstrapContextInstructions?.trim(),
+		params.agentContextInstructions?.trim(),
 		"While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as \"yeah\", \"mm-hmm\", \"got it\", or \"one sec\"; vary it and do not treat it as the final answer.",
 		consultPolicyInstructions
 	].filter(Boolean).join("\n\n");
 }
 function buildConsultPolicyInstructions(toolPolicy, consultPolicy) {
+	if (consultPolicy === "never") return "Answer directly as a standalone voice assistant. There is no OpenClaw agent to consult in this session.";
 	const policyLines = [toolPolicy === "none" ? "No OpenClaw agent consult tool is available in this session." : "Use openclaw_agent_consult for requests that need the OpenClaw agent, tools, actions, current project state, memory, or deeper reasoning."];
 	if (consultPolicy === "always") policyLines.push("For substantive user turns, call openclaw_agent_consult before giving the final spoken answer.");
 	else if (consultPolicy === "auto") policyLines.push("For simple greetings or short acknowledgements, answer directly. For anything substantive, consult OpenClaw first.");

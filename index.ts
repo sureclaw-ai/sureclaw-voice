@@ -3,8 +3,13 @@ import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
+import {
+  REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES,
+  type RealtimeBootstrapContextFileName,
+  resolveRealtimeBootstrapContextInstructions,
+} from "openclaw/plugin-sdk/realtime-bootstrap-context";
 import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL,
   resolveConfiguredRealtimeVoiceProvider,
@@ -22,13 +27,37 @@ type RealtimeVoiceConfig = {
   providers?: Record<string, unknown>;
   model?: string;
   voice?: string;
-  mode?: string;
   instructions?: string;
+  // "always" (default) | "auto" | "substantive" | "never". See the consult
+  // policy handling in the browserVoice.create handler.
   consultPolicy?: string;
   toolPolicy?: string;
+  // Legacy: a bare list of profile files folded into the realtime instructions.
+  // Superseded by `agentContext`; still honored when `agentContext` is absent so
+  // existing configs keep working. See resolveAgentContext.
   bootstrapContextFiles?: string[];
+  agentContext?: AgentContextConfig;
   minBargeInAudioEndMs?: number;
 };
+
+// Bounded agent persona/context capsule injected into realtime voice
+// instructions. Mirrors the host `realtime.agentContext` block so a browser
+// voice agent can sound like the configured agent (identity + profile files)
+// rather than a generic assistant. Opt-in via `enabled`, matching the host.
+type AgentContextConfig = {
+  enabled?: boolean;
+  // Hard cap on capsule characters appended to the instructions. Default 6000.
+  maxChars?: number;
+  // Include configured agent identity fields (name/theme/emoji). Default true.
+  includeIdentity?: boolean;
+  // Include profile files (SOUL.md/IDENTITY.md/USER.md). Default true.
+  includeWorkspaceFiles?: boolean;
+  // Profile files to include. Constrained to the SDK's allowed set; anything
+  // else is dropped with a warning. Defaults to the full allowed set.
+  files?: string[];
+};
+
+const DEFAULT_AGENT_CONTEXT_MAX_CHARS = 6000;
 
 type IceServerConfig = {
   urls: string | string[];
@@ -40,31 +69,29 @@ type IceServerConfig = {
 // ("bring your own"); nothing is baked into the app. `cloudflareTurn` mints
 // short-lived TURN credentials per session from a Cloudflare TURN key, while
 // `iceServers` is a static passthrough escape hatch for any other STUN/TURN
-// provider (self-hosted coturn, Twilio, etc.).
+// provider (self-hosted coturn, Twilio, etc.). The TURN API token is always
+// read from the CF_TURN_API_TOKEN env var so the secret never lives in config.
 type WebRtcConfig = {
   iceServers?: IceServerConfig[];
   cloudflareTurn?: {
     keyId?: string;
-    // Provide the API token directly, or name an env var to read it from so the
-    // secret stays out of openclaw.json.
-    apiToken?: string;
-    apiTokenEnv?: string;
     ttlSeconds?: number;
   };
 };
+
+// Env var holding the Cloudflare TURN API token. Fixed by design — the operator
+// sets keyId in config and exports the secret here; we never read it from config.
+const CF_TURN_API_TOKEN_ENV = "CF_TURN_API_TOKEN";
 
 // Static web-app serving. When the built PWA (the Vite `dist/`) is shipped
 // alongside this plugin, the gateway serves it directly so a single origin
 // handles both the HTTPS page and the WebSocket — no separate static host.
 type WebappConfig = {
-  // Disable serving entirely (default: served when the assets are present).
-  enabled?: boolean;
   // Mount path on the gateway (default "/voice"). The page connects its
   // WebSocket back to the same origin's root, so this only affects the page URL.
+  // The PWA is the whole plugin, so serving cannot be disabled and the assets
+  // are always the bundled ones — only the mount path is configurable.
   path?: string;
-  // Absolute path to the built assets. Defaults to the `webapp/` directory
-  // shipped next to this plugin (populated by `npm run build:webapp`).
-  dir?: string;
   // Display name shown in the page title, manifest, and the Call button.
   // Defaults to "OpenClaw" (full name "OpenClaw Voice").
   name?: string;
@@ -74,7 +101,6 @@ type PluginConfig = {
   webrtc?: WebRtcConfig;
   webapp?: WebappConfig;
   realtime?: RealtimeVoiceConfig;
-  mode?: string;
 };
 
 type RuntimeConfig = {
@@ -87,15 +113,11 @@ const PLUGIN_ID = "sureclaw-voice";
 
 // Resolves the realtime voice config for the browser session from this plugin's
 // own config slot (plugins.entries.sureclaw-voice.config.realtime), the same
-// place webrtc and webapp settings are owned. `mode` may sit alongside it under
-// config.mode or inside the realtime block.
-function resolveBrowserRealtimeConfig(
-  cfg: RuntimeConfig,
-): { realtimeConfig: RealtimeVoiceConfig; mode: string } | undefined {
-  const config = cfg.plugins?.entries?.[PLUGIN_ID]?.config;
-  const realtime = config?.realtime;
+// place webrtc and webapp settings are owned.
+function resolveBrowserRealtimeConfig(cfg: RuntimeConfig): RealtimeVoiceConfig | undefined {
+  const realtime = cfg.plugins?.entries?.[PLUGIN_ID]?.config?.realtime;
   if (!realtime || realtime.enabled === false) return undefined;
-  return { realtimeConfig: realtime, mode: normalizeVoiceMode(config?.mode ?? realtime.mode) };
+  return realtime;
 }
 
 const entry = definePluginEntry({
@@ -121,8 +143,6 @@ const entry = definePluginEntry({
             additionalProperties: false,
             properties: {
               keyId: { type: "string" },
-              apiToken: { type: "string" },
-              apiTokenEnv: { type: "string" },
               ttlSeconds: { type: "number" },
             },
           },
@@ -132,14 +152,10 @@ const entry = definePluginEntry({
         type: "object",
         additionalProperties: false,
         properties: {
-          enabled: { type: "boolean" },
           path: { type: "string" },
-          dir: { type: "string" },
           name: { type: "string" },
         },
       },
-      // Session-wide voice mode. Defaults to "agent-proxy".
-      mode: { type: "string", enum: ["agent-proxy", "stt-tts", "bidi"] },
       // Realtime voice config (provider, model, voice, instructions, tool/consult
       // policy, etc.). Loosely validated — provider-specific keys vary by provider.
       realtime: {
@@ -164,8 +180,8 @@ const entry = definePluginEntry({
 
       try {
         const cfg = context.getRuntimeConfig() as RuntimeConfig;
-        const resolved = resolveBrowserRealtimeConfig(cfg);
-        if (!resolved) {
+        const realtimeConfig = resolveBrowserRealtimeConfig(cfg);
+        if (!realtimeConfig) {
           respond(false, undefined, {
             code: "UNAVAILABLE",
             message:
@@ -173,7 +189,6 @@ const entry = definePluginEntry({
           });
           return;
         }
-        const realtimeConfig = resolved.realtimeConfig;
 
         const resolution = resolveConfiguredRealtimeVoiceProvider({
           configuredProviderId: realtimeConfig.provider,
@@ -192,13 +207,16 @@ const entry = definePluginEntry({
           return;
         }
 
-        const mode = resolved.mode;
-        const toolPolicy = resolveRealtimeVoiceAgentConsultToolPolicy(
-          realtimeConfig.toolPolicy,
-          mode === "agent-proxy" ? "owner" : "safe-read-only",
-        );
-        const consultPolicy = realtimeConfig.consultPolicy ?? (mode === "agent-proxy" ? "always" : "auto");
-        const bootstrapContextInstructions = await resolveBootstrapContext({
+        // `consultPolicy` is the single behavioral axis: "always" (the default)
+        // makes the voice surface a full OpenClaw agent proxy; "auto"/
+        // "substantive" consult only on substantive turns; "never" is pure
+        // realtime voice with no OpenClaw delegation and no consult tool.
+        const consultPolicy = realtimeConfig.consultPolicy ?? "always";
+        const toolPolicy =
+          consultPolicy === "never"
+            ? "none"
+            : resolveRealtimeVoiceAgentConsultToolPolicy(realtimeConfig.toolPolicy, "owner");
+        const agentContextInstructions = await resolveAgentContext({
           cfg,
           realtimeConfig,
           sessionKey: typedParams.sessionKey,
@@ -209,9 +227,8 @@ const entry = definePluginEntry({
           cfg,
           providerConfig: resolution.providerConfig,
           instructions: buildRealtimeInstructions({
-            mode,
             instructions: realtimeConfig.instructions,
-            bootstrapContextInstructions,
+            agentContextInstructions,
             toolPolicy,
             consultPolicy,
           }),
@@ -277,14 +294,12 @@ function registerWebappRoute(api: {
   }) => void;
 }) {
   const webapp = api.pluginConfig?.webapp;
-  if (webapp?.enabled === false) return;
 
-  const dir = resolveWebappDir(webapp?.dir);
+  const dir = resolveWebappDir();
   if (!dir) {
     api.logger?.warn?.(
       "sureclaw-voice: voice web app not served — no built assets found. " +
-        "Build the PWA and stage it into the plugin's webapp/ directory (npm run build), " +
-        "or set plugins.entries.sureclaw-voice.config.webapp.dir.",
+        "Build the PWA and stage it into the plugin's webapp/ directory (npm run build).",
     );
     return;
   }
@@ -324,14 +339,10 @@ function registerWebappRoute(api: {
   api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
 }
 
-// Locates the built web app. Honors an explicit `dir`, otherwise looks next to
-// this module — handling both the linked dev layout (index.ts at the package
-// root → ./webapp) and the installed layout (compiled dist/index.js → ../webapp).
-function resolveWebappDir(configDir?: string): string | undefined {
-  if (configDir) {
-    const dir = resolvePath(configDir);
-    return existsSync(resolvePath(dir, "index.html")) ? dir : undefined;
-  }
+// Locates the bundled web app next to this module — handling both the linked
+// dev layout (index.ts at the package root → ./webapp) and the installed layout
+// (compiled dist/index.js → ../webapp). The assets are always the bundled ones.
+function resolveWebappDir(): string | undefined {
   for (const rel of ["./webapp/", "../webapp/"]) {
     const dir = fileURLToPath(new URL(rel, import.meta.url));
     if (existsSync(resolvePath(dir, "index.html"))) return dir;
@@ -453,10 +464,10 @@ async function resolveIceServers(webrtc?: WebRtcConfig): Promise<IceServerConfig
 
   const cf = webrtc.cloudflareTurn;
   if (cf?.keyId) {
-    const apiToken = cf.apiToken || (cf.apiTokenEnv ? readEnv(cf.apiTokenEnv) : undefined);
+    const apiToken = readEnv(CF_TURN_API_TOKEN_ENV);
     if (!apiToken) {
       console.warn(
-        "sureclaw-voice: cloudflareTurn.keyId is set but no apiToken/apiTokenEnv resolved; skipping TURN.",
+        `sureclaw-voice: cloudflareTurn.keyId is set but ${CF_TURN_API_TOKEN_ENV} is not set; skipping TURN.`,
       );
     } else {
       try {
@@ -521,25 +532,81 @@ function normalizeParams(value: unknown): BrowserVoiceParams | undefined {
   return { sessionKey, agentId: agentId || "main" };
 }
 
-async function resolveBootstrapContext(params: {
+// Builds the agent-context capsule appended to realtime voice instructions.
+// Prefers the structured `agentContext` block (identity fields + profile files,
+// opt-in via `enabled`); falls back to the legacy `bootstrapContextFiles` list
+// when `agentContext` is absent so older configs keep behaving as before.
+async function resolveAgentContext(params: {
   cfg: RuntimeConfig;
   realtimeConfig: RealtimeVoiceConfig;
   sessionKey: string;
   agentId?: string;
 }) {
-  const files = params.realtimeConfig.bootstrapContextFiles;
+  const agentId = params.agentId || "main";
+  const agentContext = params.realtimeConfig.agentContext;
+
+  if (!agentContext) {
+    // Legacy path: a bare file list folded into instructions, on by default
+    // unless explicitly emptied.
+    return resolveProfileFileInstructions({
+      cfg: params.cfg,
+      agentId,
+      sessionKey: params.sessionKey,
+      files: params.realtimeConfig.bootstrapContextFiles,
+    });
+  }
+
+  if (!agentContext.enabled) return undefined;
+
+  const maxChars =
+    typeof agentContext.maxChars === "number" && agentContext.maxChars > 0
+      ? agentContext.maxChars
+      : DEFAULT_AGENT_CONTEXT_MAX_CHARS;
+
+  const sections: string[] = [];
+
+  if (agentContext.includeIdentity !== false) {
+    const identity = buildIdentityCapsule(params.cfg, agentId);
+    if (identity) sections.push(identity);
+  }
+
+  if (agentContext.includeWorkspaceFiles !== false) {
+    const fileInstructions = await resolveProfileFileInstructions({
+      cfg: params.cfg,
+      agentId,
+      sessionKey: params.sessionKey,
+      files: agentContext.files,
+    });
+    if (fileInstructions) sections.push(fileInstructions);
+  }
+
+  if (sections.length === 0) return undefined;
+  const capsule = sections.join("\n\n");
+  return capsule.length > maxChars ? `${capsule.slice(0, maxChars)}\n[truncated]` : capsule;
+}
+
+// Reads the configured (or default) profile files and formats them as bounded
+// realtime instructions via the SDK helper. Configured file names are
+// constrained to the SDK's allowed profile set; anything else is dropped.
+async function resolveProfileFileInstructions(params: {
+  cfg: RuntimeConfig;
+  agentId: string;
+  sessionKey: string;
+  files?: string[];
+}) {
+  const files = normalizeProfileFiles(params.files);
   if (files?.length === 0) return undefined;
   try {
     return await resolveRealtimeBootstrapContextInstructions({
       config: params.cfg,
-      agentId: params.agentId || "main",
+      agentId: params.agentId,
       sessionKey: params.sessionKey,
       files,
-      warn: (message) => console.warn(`sureclaw-voice: realtime bootstrap context: ${message}`),
+      warn: (message) => console.warn(`sureclaw-voice: realtime agent context: ${message}`),
     });
   } catch (error) {
     console.warn(
-      `sureclaw-voice: realtime bootstrap context unavailable: ${
+      `sureclaw-voice: realtime agent context unavailable: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
@@ -547,9 +614,37 @@ async function resolveBootstrapContext(params: {
   }
 }
 
-function normalizeVoiceMode(mode: unknown) {
-  if (mode === "stt-tts" || mode === "bidi") return mode;
-  return "agent-proxy";
+// Filters a configured file list down to the SDK's allowed profile files,
+// warning on anything dropped. Returns undefined to mean "use the SDK default".
+function normalizeProfileFiles(files?: string[]): RealtimeBootstrapContextFileName[] | undefined {
+  if (!files) return undefined;
+  const allowed = new Set<string>(REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES);
+  const kept = files.filter((file): file is RealtimeBootstrapContextFileName => allowed.has(file));
+  const dropped = files.filter((file) => !allowed.has(file));
+  if (dropped.length > 0) {
+    console.warn(
+      `sureclaw-voice: realtime agent context ignoring unsupported files (${dropped.join(", ")}); ` +
+        `allowed: ${REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES.join(", ")}`,
+    );
+  }
+  return kept;
+}
+
+// Renders the configured agent identity fields into a compact, non-spoken
+// instruction block so the voice model adopts the agent's persona.
+function buildIdentityCapsule(cfg: RuntimeConfig, agentId: string) {
+  const identity = resolveAgentIdentity(cfg, agentId);
+  if (!identity) return undefined;
+  const lines = [
+    identity.name ? `Name: ${identity.name}` : undefined,
+    identity.theme ? `Theme: ${identity.theme}` : undefined,
+    identity.emoji ? `Emoji: ${identity.emoji}` : undefined,
+  ].filter(Boolean);
+  if (lines.length === 0) return undefined;
+  return [
+    "Agent identity (speak and act as this agent; do not read these lines aloud):",
+    ...lines,
+  ].join("\n");
 }
 
 function buildProviderConfigs(realtimeConfig: RealtimeVoiceConfig) {
@@ -569,9 +664,8 @@ function buildProviderConfigOverrides(realtimeConfig: RealtimeVoiceConfig) {
 }
 
 function buildRealtimeInstructions(params: {
-  mode: string;
   instructions?: string;
-  bootstrapContextInstructions?: string;
+  agentContextInstructions?: string;
   toolPolicy: string;
   consultPolicy: string;
 }) {
@@ -582,10 +676,11 @@ function buildRealtimeInstructions(params: {
     );
   const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
 
-  if (params.mode === "agent-proxy") {
+  // "always" consult => present as a full OpenClaw agent proxy.
+  if (params.consultPolicy === "always") {
     return [
       base,
-      params.bootstrapContextInstructions?.trim(),
+      params.agentContextInstructions?.trim(),
       "Mode: OpenClaw agent proxy.",
       "You are the realtime voice surface for the same OpenClaw agent the user can message directly.",
       "Do not mention a backend, supervisor, helper, or separate system. Present the result as your own work.",
@@ -602,7 +697,7 @@ function buildRealtimeInstructions(params: {
 
   return [
     base,
-    params.bootstrapContextInstructions?.trim(),
+    params.agentContextInstructions?.trim(),
     'While waiting for OpenClaw data or tool results, use at most one short natural backchannel such as "yeah", "mm-hmm", "got it", or "one sec"; vary it and do not treat it as the final answer.',
     consultPolicyInstructions,
   ]
@@ -611,6 +706,10 @@ function buildRealtimeInstructions(params: {
 }
 
 function buildConsultPolicyInstructions(toolPolicy: string, consultPolicy: string) {
+  if (consultPolicy === "never") {
+    return "Answer directly as a standalone voice assistant. There is no OpenClaw agent to consult in this session.";
+  }
+
   const policyLines = [
     toolPolicy === "none"
       ? "No OpenClaw agent consult tool is available in this session."

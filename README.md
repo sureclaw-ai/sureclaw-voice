@@ -9,8 +9,18 @@ terminator) in front of the gateway port and you're done.
 - App at `https://<host>/voice`, WebSocket back to `wss://<host>` — same origin.
 - Realtime voice config lives in the plugin's own config under
   `plugins.entries.sureclaw-voice.config.realtime` (provider, model, voice,
-  instructions, tool/consult policy).
+  instructions, tool/consult policy, and an agent persona/context capsule).
 - The plugin does **no auth** — the gateway authenticates the WebSocket itself.
+
+## Agent installation prompt
+
+Hand the install to your OpenClaw agent — paste this:
+
+```
+You will be installing the OpenClaw plugin [SureClaw Voice](https://github.com/sureclaw-ai/sureclaw-voice)
+It is a browser based voice interface to call your OpenClaw without and with higher quality than a phone number.
+For proper instructions, read [INSTALLATION.md](https://github.com/sureclaw-ai/sureclaw-voice/blob/main/INSTALLATION.md)
+```
 
 ## Install
 
@@ -23,7 +33,11 @@ openclaw plugins enable sureclaw-voice
 The plugin id is `sureclaw-voice`, so it lives at
 `plugins.entries.sureclaw-voice` in `openclaw.json`.
 
-### Plugin config (all optional)
+### Plugin config
+
+A complete, current config (`plugins.entries.sureclaw-voice` in `openclaw.json`).
+Everything is optional except a usable `realtime.provider` — without one,
+`browserVoice.create` returns `UNAVAILABLE`.
 
 ```jsonc
 "plugins": {
@@ -31,19 +45,55 @@ The plugin id is `sureclaw-voice`, so it lives at
     "sureclaw-voice": {
       "enabled": true,
       "config": {
-        "webapp": {
-          "path": "/voice"            // mount path (default "/voice")
-          // "dir": "/abs/path/to/dist" // override the bundled web app
-          // "enabled": false           // don't serve the page at all
+        "realtime": {
+          "enabled": true,
+          "provider": "openai",          // a registered realtime voice provider
+          "model": "gpt-realtime-2",     // provider default if omitted
+          "voice": "alloy",              // provider default if omitted
+          "toolPolicy": "owner",         // safe-read-only | owner | none
+          // consultPolicy is the behavioral dial:
+          //   "always"     (default) full OpenClaw agent proxy — delegate everything
+          //   "auto"/"substantive"    consult only on substantive turns
+          //   "never"                 pure voice; no OpenClaw, no consult tool
+          "consultPolicy": "always",
+          // "instructions": "…",        // override the base voice instructions
+
+          // Persona/identity capsule injected into the voice instructions so the
+          // agent sounds like *your* agent. Opt-in via enabled.
+          "agentContext": {
+            "enabled": true,
+            "includeIdentity": true,            // name/theme/emoji from agent config
+            "includeWorkspaceFiles": true,      // the profile files below
+            "files": ["SOUL.md", "IDENTITY.md", "USER.md"],
+            "maxChars": 6000
+          },
+
+          // Provider-specific config, keyed by provider id. The OpenAI realtime
+          // provider also reads OPENAI_API_KEY from the environment.
+          "providers": {
+            "openai": { "apiKey": "sk-…" }
+          }
         },
-        "webrtc": {                    // optional TURN relay for mobile/5G
-          "cloudflareTurn": { "keyId": "…", "apiTokenEnv": "CF_TURN_API_TOKEN", "ttlSeconds": 86400 }
+
+        "webapp": {
+          "path": "/voice"               // mount path (default "/voice")
+          // "name": "Acme"              // title + Call-button label
+        },
+
+        "webrtc": {                      // optional TURN relay for mobile/5G
+          // The TURN API token is read from the CF_TURN_API_TOKEN env var.
+          "cloudflareTurn": { "keyId": "…", "ttlSeconds": 86400 }
         }
       }
     }
   }
 }
 ```
+
+> **Consult tuning.** For the browser path, the consult runs through the gateway's
+> core Talk handler, so `consultThinkingLevel` / `consultFastMode` are read from
+> the top-level **`talk`** section (e.g. `"talk": { "consultThinkingLevel": "low" }`),
+> not from this plugin's `realtime` block.
 
 ## Authentication
 
