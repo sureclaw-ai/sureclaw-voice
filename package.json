@@ -1,6 +1,6 @@
 {
   "name": "sureclaw-voice",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "SureClaw Voice — OpenClaw plugin that serves the browser voice PWA and mints browser WebRTC realtime sessions from the configured realtime voice config.",
   "license": "UNLICENSED",

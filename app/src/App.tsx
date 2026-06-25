@@ -14,7 +14,7 @@ import { Visualizer } from "./Visualizer";
 import { InstallBanner } from "./InstallBanner";
 import { setCallActive } from "./callState";
 
-const STORAGE_KEY = "openclaw.voice.settings";
+const STORAGE_KEY = "openclaw.sureclaw-voice.settings";
 
 // Read the configured assistant name from the <meta name="x-app-assistant-name">
 // tag, which the gateway rewrites from __APP_NAME__ at serve time. Falls back
@@ -58,8 +58,19 @@ const PROXY_AUTHED = isProxyAuthedGateway();
 // non-browser contexts. For local Vite HMR dev (page on :5173, gateway
 // elsewhere), `app/openclaw/dev.sh` injects VITE_GATEWAY_URL so the PWA targets
 // the auto-picked gateway WS without a manual Settings override.
+// The dev-only gateway URL injected by `app/openclaw/dev.sh` via VITE_GATEWAY_URL.
+// Gated on `import.meta.env.DEV` so it is ONLY honored in a dev build: Vite inlines
+// `import.meta.env.*` at build time, so a stray VITE_GATEWAY_URL in the production
+// build environment would otherwise be baked into the bundle as a literal and
+// dead-code-eliminate the same-origin `window.location` path below — pinning every
+// production client to localhost. In a production build this folds to `undefined`.
+function injectedGatewayUrl(): string | undefined {
+  if (!import.meta.env.DEV) return undefined;
+  return import.meta.env.VITE_GATEWAY_URL as string | undefined;
+}
+
 function defaultGatewayUrl(): string {
-  const injected = import.meta.env.VITE_GATEWAY_URL as string | undefined;
+  const injected = injectedGatewayUrl();
   if (injected) return injected;
   if (typeof window !== "undefined" && window.location?.host) {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -118,7 +129,9 @@ function loadSettings(): GatewaySettings {
   // In Vite HMR dev, dev.sh injects VITE_GATEWAY_URL for the auto-picked
   // gateway port. Treat it as authoritative — it wins over a stale
   // localStorage URL so the PWA always hits the rig's WS, not a dead same-origin.
-  const injected = import.meta.env.VITE_GATEWAY_URL as string | undefined;
+  // `injectedGatewayUrl()` is dev-only, so in production this is always undefined
+  // and a stored or same-origin URL is never clobbered by a baked-in localhost.
+  const injected = injectedGatewayUrl();
   try {
     const merged: GatewaySettings = {
       ...defaultSettings,
