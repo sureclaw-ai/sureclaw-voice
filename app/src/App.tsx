@@ -16,6 +16,10 @@ import { setCallActive } from "./callState";
 
 const STORAGE_KEY = "openclaw.sureclaw-voice.settings";
 
+// How long to wait after the model stops speaking before the "thinking" pending
+// pulse comes in, so the cue doesn't clip the tail of the spoken lead-in.
+const PENDING_PULSE_DELAY_MS = 700;
+
 // Read the configured assistant name from the <meta name="x-app-assistant-name">
 // tag, which the gateway rewrites from __APP_NAME__ at serve time. Falls back
 // to "OpenClaw" when unset (e.g. when the page is opened directly from the Vite
@@ -399,8 +403,16 @@ export default function App() {
     // consult begins the moment the tool call lands on the data channel, which is
     // typically while the model's lead-in ("Let me look into that…") is still
     // playing out the speakers. Starting the cue then would talk over it.
-    if (consulting && !speaking) callSounds.startPending();
-    else callSounds.stopPending();
+    if (!(consulting && !speaking)) {
+      callSounds.stopPending();
+      return;
+    }
+    // Let a beat of silence settle after the lead-in finishes before the pulse
+    // comes in — starting the instant speech ends clips its tail and feels
+    // abrupt. If speech resumes or the consult resolves within the delay, the
+    // cleanup cancels the start so the cue never plays.
+    const timer = window.setTimeout(() => callSounds.startPending(), PENDING_PULSE_DELAY_MS);
+    return () => window.clearTimeout(timer);
   }, [consulting, speaking]);
 
   useEffect(() => {
