@@ -186,6 +186,34 @@ in). Don't make the operator decide on any of the rest; just set it.
 Restart the gateway after writing the config. Without a usable `realtime.provider`,
 `browserVoice.create` returns `UNAVAILABLE` and calls won't connect.
 
+> **If you want `fast_context` to recall from past sessions, not just memory:**
+> listing `"sessions"` in `fastContext.sources` above is *not* enough on its own
+> — that's only the request handed to the memory search, which then filters to
+> the sources the manager actually **indexes**. Session indexing lives in the
+> top-level **`agents.defaults.memorySearch`** section and is gated twice:
+>
+> 1. add `"sessions"` to `memorySearch.sources` (defaults to `["memory"]` only),
+>    and
+> 2. set `memorySearch.experimental.sessionMemory: true` — it's an experimental
+>    flag (default off), and without it `sessions` is **silently stripped** from
+>    the indexed set even when listed in `sources`.
+>
+> ```jsonc
+> "agents": {
+>   "defaults": {
+>     "memorySearch": {
+>       "sources": ["memory", "sessions"],
+>       "experimental": { "sessionMemory": true }
+>     }
+>   }
+> }
+> ```
+>
+> After enabling, the gateway indexes session transcripts on restart, embedding
+> one chunk at a time; a large history takes a while. Confirm it's working by
+> checking that the memory manager's `Sources:` line shows `sessions` and the
+> chunk count grows; if `Sources:` still says just `memory`, the flag isn't on.
+
 ---
 
 ## Step 5 — Authentication (match it to the access choice)

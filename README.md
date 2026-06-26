@@ -114,6 +114,36 @@ Everything is optional except a usable `realtime.provider` — without one,
 > top-level **`talk`** section (e.g. `"talk": { "consultThinkingLevel": "low" }`),
 > not from this plugin's `realtime` block.
 
+> **`sessions` in `fastContext.sources` is not enough on its own.** That list is
+> only the *request* passed into the memory search — the builtin manager then
+> filters it down to the sources it actually **indexes**
+> (`searchSources = requested.filter(s => this.sources.has(s))`). Two separate
+> things gate `sessions`, both in the top-level **`agents.defaults.memorySearch`**
+> section (not this plugin's config):
+>
+> 1. **`sources` must include `sessions`** — defaults to `["memory"]` only, so
+>    `sessions` is dropped before the search runs if you don't add it.
+> 2. **`experimental.sessionMemory: true`** — session memory is an experimental
+>    flag (default `false`). `normalizeSources()` **silently strips `sessions`**
+>    from the indexed set unless this is on, so adding it to `sources` alone is a
+>    no-op.
+>
+> ```jsonc
+> "agents": {
+>   "defaults": {
+>     "memorySearch": {
+>       "sources": ["memory", "sessions"],
+>       "experimental": { "sessionMemory": true }
+>     }
+>   }
+> }
+> ```
+>
+> Session transcripts are indexed on gateway (re)start and embedded one chunk at a
+> time, so the first index of a large history takes a while — watch
+> the manager's `Sources:` line and chunk count grow to confirm `sessions` is
+> actually indexing before expecting `fast_context` to return session hits.
+
 ## Authentication
 
 The plugin serves only the static page (no credential is embedded). The gateway
