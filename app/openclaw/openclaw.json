@@ -8,6 +8,14 @@
       "dangerouslyDisableDeviceAuth": true
     }
   },
+  "memory": {
+    "backend": "qmd",
+    "qmd": {
+      "command": "${SURECLAW_VOICE_ROOT}/app/openclaw/node_modules/.bin/qmd",
+      "sessions": { "enabled": true },
+      "searchMode": "search"
+    }
+  },
   "agents": {
     "defaults": {
       "model": "openai/gpt-5.4",

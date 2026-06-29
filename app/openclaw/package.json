@@ -1,0 +1,12 @@
+{
+  "name": "sureclaw-voice-openclaw-testrig",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local OpenClaw test-rig tooling for the sureclaw-voice plugin. Pins qmd so the gateway's qmd memory backend resolves to a vendored binary instead of a global install.",
+  "dependencies": {
+    "@tobilu/qmd": "^2.5.3"
+  },
+  "trustedDependencies": [
+    "node-llama-cpp"
+  ]
+}

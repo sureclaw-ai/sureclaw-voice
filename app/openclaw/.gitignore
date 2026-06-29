@@ -5,6 +5,10 @@
 # Local OpenClaw runtime state (OPENCLAW_STATE_DIR) — SQLite, workspace, logs.
 .state/
 
+# Vendored test-rig tooling (qmd memory backend). package.json + lockfile are
+# committed; the installed tree is not.
+node_modules/
+
 # Stray gateway log files if you redirect output here.
 *.log
 
