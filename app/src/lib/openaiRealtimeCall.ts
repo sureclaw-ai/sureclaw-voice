@@ -1,4 +1,10 @@
-import type { CallStatus, GatewayEvent, RealtimeBrowserSession, TranscriptEntry } from "../types";
+import type {
+  CallStatus,
+  GatewayEvent,
+  RealtimeBrowserSession,
+  ReplayTurn,
+  TranscriptEntry,
+} from "../types";
 import { GatewayClient } from "./gatewayClient";
 
 type RealtimeEvent = Record<string, unknown> & { type?: string };
@@ -115,12 +121,23 @@ export class OpenAIRealtimeCall {
   // live tool detail instead of clobbering it with a generic string.
   private consultDetail = "";
   private turnDetectionSuspended = false;
+  // The assistant transcript accumulated from `response.audio_transcript.delta`
+  // for the in-progress response. A turn is normally committed on the matching
+  // `.done`, but an abrupt drop (real or simulated) can land before `.done`
+  // arrives — and once we tear the old call down its events stop flowing, so
+  // that turn would be lost. Holding the running text lets us flush it on
+  // connection loss so the last bit of the conversation survives the reconnect.
+  private pendingAssistantTranscript = "";
 
   constructor(
     private readonly gateway: GatewayClient,
     private readonly sessionKey: string,
     private readonly session: RealtimeBrowserSession,
     private readonly callbacks: CallCallbacks,
+    // Prior dialogue turns to seed into this session before the user speaks, so
+    // a reconnect/resume picks up the conversation where it dropped. Empty for a
+    // fresh call. Replayed once, when the data channel opens.
+    private readonly replayTurns: ReplayTurn[] = [],
   ) {}
 
   async start() {
@@ -155,6 +172,7 @@ export class OpenAIRealtimeCall {
 
     this.channel = this.peer.createDataChannel("oai-events");
     this.channel.addEventListener("open", () => {
+      this.replayConversation();
       this.callbacks.onStatus("listening");
       this.callbacks.onLog("Realtime data channel is open");
     });
@@ -182,6 +200,32 @@ export class OpenAIRealtimeCall {
       );
     }
     await this.peer.setRemoteDescription({ type: "answer", sdp: responseText });
+  }
+
+  // Seed the fresh session with the prior conversation so the model resumes
+  // with full context instead of starting blank. Each turn becomes a stored
+  // conversation item; user turns are input items (`input_text`) and assistant
+  // turns are output items (`text`) — the API rejects the wrong content type per
+  // role. History only: we never call response.create here, so the model stays
+  // silent until the user speaks and turn detection drives the next response
+  // with the replayed context already in place.
+  private replayConversation() {
+    if (this.replayTurns.length === 0) return;
+    let replayed = 0;
+    for (const turn of this.replayTurns) {
+      const text = turn.text.trim();
+      if (!text) continue;
+      this.send({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: turn.role,
+          content: [{ type: turn.role === "user" ? "input_text" : "text", text }],
+        },
+      });
+      replayed += 1;
+    }
+    if (replayed > 0) this.callbacks.onLog(`Replayed ${replayed} prior turns to resume the conversation`);
   }
 
   private handleConnectionStateChange() {
@@ -234,11 +278,27 @@ export class OpenAIRealtimeCall {
 
   private reportConnectionLost(state: string) {
     if (this.closed) return;
+    // Commit any in-progress assistant turn BEFORE handing off — onConnectionLost
+    // snapshots the transcript to replay it into the reconnected session, so the
+    // flush has to land first or the last spoken bit is dropped from the resume.
+    this.flushPendingTranscript();
     this.callbacks.onStatus("error", `WebRTC ${state}`);
     this.callbacks.onConnectionLost(state);
   }
 
+  // Commit the running assistant transcript as a turn (if any) and clear it, so
+  // an in-flight response that never reached `.done` still survives a drop or a
+  // hang-up. Idempotent: a no-op once the buffer is empty.
+  private flushPendingTranscript() {
+    const text = this.pendingAssistantTranscript.trim();
+    this.pendingAssistantTranscript = "";
+    if (text) this.pushTranscript("assistant", text);
+  }
+
   stop() {
+    // Preserve a turn that was still streaming when the user hung up, so it is
+    // there to resume later. Must run before `closed` gates event handling.
+    this.flushPendingTranscript();
     this.closed = true;
     this.clearRecoveryTimer();
     this.channel?.close();
@@ -257,6 +317,21 @@ export class OpenAIRealtimeCall {
     this.responseCreatePending = false;
     this.toolCallsInFlight = 0;
     this.turnDetectionSuspended = false;
+  }
+
+  // Dev-only test hook: force the fatal connection-lost path so reconnect +
+  // transcript replay can be exercised without waiting for a real network drop.
+  // Mirrors an unrecoverable ICE "failed"; the caller's onConnectionLost then
+  // tears this call down and rebuilds it. Gated behind import.meta.env.DEV at
+  // the (single) call site, so the button that invokes it is compiled away in
+  // production builds.
+  simulateDropout() {
+    // import.meta.env.DEV folds to a literal `false` in production, so the body
+    // below is unreachable and dead-code-eliminated — the method collapses to a
+    // bare `return` stub and the log string never ships.
+    if (!import.meta.env.DEV || this.closed) return;
+    this.callbacks.onLog("Simulating connection dropout (dev)");
+    this.reportConnectionLost("failed");
   }
 
   setMicMuted(muted: boolean) {
@@ -303,7 +378,15 @@ export class OpenAIRealtimeCall {
       case "conversation.item.input_audio_transcription.completed":
         this.pushTranscript("user", stringField(event, "transcript"));
         return;
+      case "response.audio_transcript.delta":
+        // Accumulate the running assistant transcript so an abrupt drop before
+        // `.done` can still flush the in-progress turn (see reportConnectionLost).
+        this.pendingAssistantTranscript += stringField(event, "delta") || "";
+        return;
       case "response.audio_transcript.done":
+        // The `.done` payload is the authoritative full transcript; commit it and
+        // drop the running accumulation so it can't be double-flushed on loss.
+        this.pendingAssistantTranscript = "";
         this.pushTranscript("assistant", stringField(event, "transcript"));
         return;
       case "response.function_call_arguments.delta":
@@ -332,12 +415,18 @@ export class OpenAIRealtimeCall {
       case "response.created":
         this.responseActive = true;
         this.responseCreateInFlight = false;
+        // Start the running transcript fresh for this response.
+        this.pendingAssistantTranscript = "";
         this.callbacks.onStatus("thinking", "Generating response");
         return;
       case "response.cancelled":
       case "response.done":
         this.responseActive = false;
         this.responseCreateInFlight = false;
+        // A cancelled response (e.g. a barge-in) never emits audio_transcript.done,
+        // so commit whatever was spoken before discarding it; a normal done has
+        // already cleared this, making the flush a no-op.
+        this.flushPendingTranscript();
         // The response that carried a function call completes (response.done)
         // while the consult it triggered is still running. Don't flip back to
         // "listening" yet — that would clear the pending consult cue mid-flight,

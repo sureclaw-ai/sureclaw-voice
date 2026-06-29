@@ -50,3 +50,8 @@ export type TranscriptEntry = {
 };
 
 export type CallStatus = "idle" | "connecting" | "listening" | "thinking" | "error";
+
+// A single dialogue turn replayed into a fresh realtime session to resume a
+// conversation. Only user/assistant text is replayable as a conversation item
+// (the API takes no audio on create), so this is narrower than TranscriptEntry.
+export type ReplayTurn = { role: "user" | "assistant"; text: string };

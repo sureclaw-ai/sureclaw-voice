@@ -5,10 +5,17 @@ import type {
   GatewayEvent,
   GatewaySettings,
   RealtimeBrowserSession,
+  ReplayTurn,
   TranscriptEntry,
 } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
 import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
+import {
+  clearConversation,
+  hasResumableConversation,
+  loadConversation,
+  saveConversation,
+} from "./lib/transcriptStore";
 import { callSounds } from "./lib/callSounds";
 import { Visualizer } from "./Visualizer";
 import { InstallBanner } from "./InstallBanner";
@@ -19,6 +26,11 @@ const STORAGE_KEY = "openclaw.sureclaw-voice.settings";
 // How long to wait after the model stops speaking before the "thinking" pending
 // pulse comes in, so the cue doesn't clip the tail of the spoken lead-in.
 const PENDING_PULSE_DELAY_MS = 700;
+
+// How many times a dropped call silently reconnects (and replays the
+// conversation) before giving up and surfacing the error screen. Each attempt
+// backs off a little; a truly dead network exhausts these and the user is told.
+const MAX_RECONNECT_ATTEMPTS = 4;
 
 // Read the configured assistant name from the <meta name="x-app-assistant-name">
 // tag, which the gateway rewrites from __APP_NAME__ at serve time. Falls back
@@ -173,8 +185,22 @@ export default function App() {
   // the pending pulse fills. Tracked separately from the status detail, which
   // now shows live tool activity ("Running bash…") rather than a fixed string.
   const [consulting, setConsulting] = useState(false);
+  // Whether a prior conversation is saved and can be resumed. Seeded from
+  // storage so it survives a full PWA close, and kept in sync as turns are
+  // captured / cleared. Drives the idle Resume-vs-Start-new choice.
+  const [resumeAvailable, setResumeAvailable] = useState(() => hasResumableConversation());
   const gatewayRef = useRef<GatewayClient | null>(null);
   const callRef = useRef<OpenAIRealtimeCall | null>(null);
+  // The live transcript of the current/last call, captured turn-by-turn from the
+  // realtime session and mirrored to storage. Replayed into a fresh session on
+  // reconnect/resume so the model picks the conversation back up.
+  const transcriptRef = useRef<ReplayTurn[]>([]);
+  // The sessionKey the current call resolved to, so captured turns persist under
+  // the right key even when it was auto-resolved (settings.sessionKey empty).
+  const sessionKeyRef = useRef<string>("");
+  // Consecutive auto-reconnect attempts since the last stable connection. Reset
+  // to 0 once a reconnect reaches "listening"; capped by MAX_RECONNECT_ATTEMPTS.
+  const reconnectAttemptsRef = useRef(0);
   // Whether the user currently intends to be in a call. Guards against a late
   // connection-lost event (after a deliberate hang-up) flipping to an error.
   const wantCallRef = useRef(false);
@@ -203,15 +229,31 @@ export default function App() {
     );
   }
 
-  async function startCall() {
+  // Starts a call either fresh ("new") or resuming the last conversation
+  // ("resume"). Resume loads the saved transcript (and its sessionKey, so both
+  // the voice layer and the OpenClaw session continue together); new wipes it.
+  async function startCall(mode: "new" | "resume") {
     wantCallRef.current = true;
     // Resume audio from within the click gesture so the call cues are allowed
     // to play once the connection progresses.
     callSounds.unlock();
     saveSettings();
     setShowSettings(false);
+    reconnectAttemptsRef.current = 0;
+
+    let sessionKeyOverride: string | undefined;
+    if (mode === "resume") {
+      const stored = loadConversation();
+      transcriptRef.current = stored ? [...stored.turns] : [];
+      sessionKeyOverride = stored?.sessionKey || undefined;
+    } else {
+      transcriptRef.current = [];
+      clearConversation();
+      setResumeAvailable(false);
+    }
+
     try {
-      await establishCall();
+      await establishCall({ replayTurns: [...transcriptRef.current], sessionKeyOverride });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       teardownCall();
@@ -219,8 +261,14 @@ export default function App() {
     }
   }
 
-  // Builds a fresh Gateway connection + voice session + WebRTC call.
-  async function establishCall() {
+  // Builds a fresh Gateway connection + voice session + WebRTC call, seeding the
+  // realtime session with `replayTurns` so a resume/reconnect continues the
+  // conversation. `sessionKeyOverride` pins the session key (used by resume and
+  // reconnect); otherwise it auto-resolves from settings/agents.list.
+  async function establishCall(opts: {
+    replayTurns: ReplayTurn[];
+    sessionKeyOverride?: string;
+  }) {
     teardownCall();
     setStatus("connecting");
     setDetail("Opening gateway");
@@ -248,7 +296,11 @@ export default function App() {
       log(`Session-event subscribe failed (tool activity may be hidden): ${String(error)}`);
     }
 
-    const sessionKey = await resolveSessionKey(gateway, settings.sessionKey);
+    const sessionKey = await resolveSessionKey(
+      gateway,
+      opts.sessionKeyOverride ?? settings.sessionKey,
+    );
+    sessionKeyRef.current = sessionKey;
     if (sessionKey !== settings.sessionKey) updateSettings({ sessionKey });
 
     setDetail("Setting up voice");
@@ -268,28 +320,83 @@ export default function App() {
       throw new Error(`Gateway returned unsupported transport: ${voiceSession.transport}`);
     }
 
-    const call = new OpenAIRealtimeCall(gateway, sessionKey, voiceSession, {
-      onStatus: (next, nextDetail = "") => {
-        setStatus(next);
-        setDetail(nextDetail);
+    const call = new OpenAIRealtimeCall(
+      gateway,
+      sessionKey,
+      voiceSession,
+      {
+        onStatus: (next, nextDetail = "") => {
+          // Reaching "listening" means the (re)connection is stable, so the
+          // reconnect budget is reset for the next independent drop.
+          if (next === "listening") reconnectAttemptsRef.current = 0;
+          setStatus(next);
+          setDetail(nextDetail);
+        },
+        onTranscript: (entry: TranscriptEntry) => {
+          console.debug(`[transcript] ${entry.role}: ${entry.text}`);
+          captureTurn(entry);
+        },
+        onLog: log,
+        onStream: addStream,
+        onSpeaking: setSpeaking,
+        onConsulting: setConsulting,
+        // The realtime session is gone, but we hold the transcript — so a drop
+        // is recoverable: reconnect and replay rather than dumping the user on
+        // an error screen. attemptReconnect falls back to the error screen once
+        // retries are exhausted or there is nothing captured to resume.
+        onConnectionLost: (state) => {
+          if (!wantCallRef.current) return; // already torn down by a deliberate hang-up
+          void attemptReconnect(state);
+        },
       },
-      onTranscript: (entry: TranscriptEntry) =>
-        console.debug(`[transcript] ${entry.role}: ${entry.text}`),
-      onLog: log,
-      onStream: addStream,
-      onSpeaking: setSpeaking,
-      onConsulting: setConsulting,
-      // A fatal WebRTC loss does NOT silently reconnect — it surfaces an error
-      // screen so the drop is visible and the user decides whether to redial.
-      onConnectionLost: (state) => {
-        if (!wantCallRef.current) return; // already torn down by a deliberate hang-up
-        teardownCall();
-        raiseFatalError("Connection lost", describeConnectionLoss(state));
-      },
-    });
+      opts.replayTurns,
+    );
     callRef.current = call;
     await call.start();
     log("WebRTC call started");
+  }
+
+  // Records a spoken turn (user or assistant — the transcript the model itself
+  // emits) into the live buffer and mirrors it to storage, so the conversation
+  // can be replayed into a fresh session on reconnect/resume.
+  function captureTurn(entry: TranscriptEntry) {
+    if (entry.role !== "user" && entry.role !== "assistant") return;
+    const text = entry.text.trim();
+    if (!text) return;
+    transcriptRef.current.push({ role: entry.role, text });
+    saveConversation(sessionKeyRef.current, transcriptRef.current);
+    setResumeAvailable(true);
+  }
+
+  // Silently rebuilds the call after a drop, replaying the captured transcript
+  // so the model resumes mid-conversation. Backs off per attempt and gives up to
+  // the error screen once MAX_RECONNECT_ATTEMPTS is hit or nothing was captured.
+  async function attemptReconnect(state: string) {
+    const turns = transcriptRef.current;
+    if (turns.length === 0 || reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      teardownCall();
+      raiseFatalError("Connection lost", describeConnectionLoss(state));
+      return;
+    }
+    reconnectAttemptsRef.current += 1;
+    const attempt = reconnectAttemptsRef.current;
+    teardownCall();
+    setStatus("connecting");
+    setDetail(`Reconnecting (${attempt}/${MAX_RECONNECT_ATTEMPTS})…`);
+    log(`Connection ${state}; reconnecting (attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS})`);
+    await delay(750 * attempt);
+    if (!wantCallRef.current) return; // hung up while waiting to retry
+    try {
+      await establishCall({
+        replayTurns: [...turns],
+        sessionKeyOverride: sessionKeyRef.current || undefined,
+      });
+    } catch (error) {
+      // The rebuild failed before a live call existed, so no connection-lost
+      // event will fire — re-arm the retry chain here (still bounded by the cap).
+      log(`Reconnect attempt ${attempt} failed: ${String(error)}`);
+      void attemptReconnect(state);
+    }
   }
 
   // Tears down the active call + Gateway without changing the user's call intent.
@@ -341,6 +448,14 @@ export default function App() {
     setCallActive(active);
     return () => setCallActive(false);
   }, [active]);
+
+  // Re-evaluate resumability whenever we settle back to idle, so a conversation
+  // that has aged past the resume TTL stops being offered (hasResumableConversation
+  // drops a stale record). The freshly-ended call's record is still within the
+  // window here, so the normal post-hang-up flow keeps offering Resume.
+  useEffect(() => {
+    if (status === "idle") setResumeAvailable(hasResumableConversation());
+  }, [status]);
 
   // Hold a screen wake lock while a call is active so the phone does not
   // auto-lock and suspend the WebRTC mic — the most common avoidable way a
@@ -453,9 +568,13 @@ export default function App() {
         <div className="dock">
           {isError ? (
             <>
-              <button type="button" className="callButton call" onClick={startCall}>
+              <button
+                type="button"
+                className="callButton call"
+                onClick={() => startCall(resumeAvailable ? "resume" : "new")}
+              >
                 <RotateCcw size={22} />
-                Reconnect
+                {resumeAvailable ? "Resume" : "Reconnect"}
               </button>
               <button type="button" className="textButton" onClick={dismissError}>
                 Dismiss
@@ -476,9 +595,35 @@ export default function App() {
                 <PhoneOff size={22} />
                 End call
               </button>
+              {/* Dev-only: import.meta.env.DEV folds to a literal `false` in
+                  production, so this branch is dead-code-eliminated from the
+                  bundle and the button never ships. */}
+              {import.meta.env.DEV && (
+                <button
+                  type="button"
+                  className="textButton"
+                  onClick={() => callRef.current?.simulateDropout()}
+                >
+                  Simulate dropout
+                </button>
+              )}
+            </>
+          ) : resumeAvailable ? (
+            <>
+              <button
+                type="button"
+                className="callButton call"
+                onClick={() => startCall("resume")}
+              >
+                <Phone size={22} />
+                Resume conversation
+              </button>
+              <button type="button" className="textButton" onClick={() => startCall("new")}>
+                Start new
+              </button>
             </>
           ) : (
-            <button type="button" className="callButton call" onClick={startCall}>
+            <button type="button" className="callButton call" onClick={() => startCall("new")}>
               <Phone size={22} />
               Call {APP_NAME}
             </button>
