@@ -2,7 +2,7 @@
   "id": "sureclaw-voice",
   "name": "SureClaw Voice",
   "description": "Serves the browser voice web app and mints browser WebRTC realtime sessions from the configured realtime voice config.",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "activation": {
     "onStartup": true
   },

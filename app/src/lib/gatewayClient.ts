@@ -104,7 +104,7 @@ export class GatewayClient {
       client: {
         id: "openclaw-control-ui",
         displayName: "OpenClaw Voice PWA",
-        version: "0.1.0",
+        version: "0.1.3",
         platform: "web",
         mode: "ui",
       },
