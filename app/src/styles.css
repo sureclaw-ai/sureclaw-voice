@@ -483,6 +483,15 @@ select:focus {
 /* ---------- iOS install guide (full-screen card) ---------- */
 
 .installGuide {
+  /* Neutralize the native <dialog> UA styles (border, margins, fit-content
+     sizing, Canvas colors) so the modal keeps the original overlay layout. */
+  border: 0;
+  margin: 0;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  color: inherit;
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -494,6 +503,12 @@ select:focus {
   backdrop-filter: blur(6px);
   overflow-y: auto;
   animation: installGuideFade 0.2s ease both;
+}
+
+.installGuide::backdrop {
+  /* The element paints its own translucent overlay; the native backdrop
+     behind it would add extra darkening. */
+  background: none;
 }
 
 @keyframes installGuideFade {

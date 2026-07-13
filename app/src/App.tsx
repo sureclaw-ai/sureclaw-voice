@@ -32,6 +32,17 @@ const PENDING_PULSE_DELAY_MS = 700;
 // backs off a little; a truly dead network exhausts these and the user is told.
 const MAX_RECONNECT_ATTEMPTS = 4;
 
+// How long after the latest captured turn before the rolling transcript flush
+// fires. Resets per turn, so a rapid exchange batches into one inject instead
+// of one per line.
+const TRANSCRIPT_FLUSH_DEBOUNCE_MS = 2000;
+
+type TranscriptPersistenceState = {
+  flushedTurnCount: number;
+  injected: boolean;
+  chain: Promise<void> | null;
+};
+
 // Read the configured assistant name from the <meta name="x-app-assistant-name">
 // tag, which the gateway rewrites from __APP_NAME__ at serve time. Falls back
 // to "OpenClaw" when unset (e.g. when the page is opened directly from the Vite
@@ -59,14 +70,29 @@ const APP_NAME = readAssistantName();
 // keeps Settings available for manual overrides.
 function isProxyAuthedGateway(): boolean {
   return (
-    document
-      .querySelector('meta[name="x-app-gateway-auth"]')
-      ?.getAttribute("content")
-      ?.trim() === "trusted-proxy"
+    document.querySelector('meta[name="x-app-gateway-auth"]')?.getAttribute("content")?.trim() ===
+    "trusted-proxy"
   );
 }
 
 const PROXY_AUTHED = isProxyAuthedGateway();
+
+// Whether, on hang-up, we also run an agent turn to store memories from the call.
+// Read from the <meta name="x-app-record-memories"> tag the gateway rewrites from
+// __APP_RECORD_MEMORIES__ (config: webapp.recordMemoriesOnCallEnd). Off unless
+// explicitly "true" — the transcript is always persisted regardless; this only
+// controls the extra per-call memory-extraction turn. The unsubstituted
+// placeholder on the raw Vite dev server therefore stays off.
+function readRecordMemories(): boolean {
+  return (
+    document
+      .querySelector('meta[name="x-app-record-memories"]')
+      ?.getAttribute("content")
+      ?.trim() === "true"
+  );
+}
+
+const RECORD_MEMORIES = readRecordMemories();
 
 // Same-origin Gateway endpoint. When the app is served by the OpenClaw gateway
 // itself (e.g. https://host/voice behind cloudflared), the WebSocket goes back
@@ -138,7 +164,6 @@ const defaultSettings: GatewaySettings = {
   gatewayUrl: defaultGatewayUrl(),
   authMode: "token",
   secret: "",
-  sessionKey: "",
 };
 
 function loadSettings(): GatewaySettings {
@@ -149,15 +174,86 @@ function loadSettings(): GatewaySettings {
   // and a stored or same-origin URL is never clobbered by a baked-in localhost.
   const injected = injectedGatewayUrl();
   try {
+    const stored = JSON.parse(
+      localStorage.getItem(STORAGE_KEY) || "{}",
+    ) as Partial<GatewaySettings>;
     const merged: GatewaySettings = {
-      ...defaultSettings,
-      ...JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"),
+      gatewayUrl: stored.gatewayUrl ?? defaultSettings.gatewayUrl,
+      authMode: stored.authMode ?? defaultSettings.authMode,
+      secret: stored.secret ?? defaultSettings.secret,
     };
     if (injected) merged.gatewayUrl = injected;
     return merged;
   } catch {
     return injected ? { ...defaultSettings, gatewayUrl: injected } : defaultSettings;
   }
+}
+
+// Formats transcript turns as the `User:`/`Assistant:` lines persisted into the
+// OpenClaw session — one shape shared by the rolling and hang-up flushes.
+function formatTranscriptLines(turns: ReplayTurn[]): string {
+  return turns
+    .map((turn) => `${turn.role === "assistant" ? "Assistant" : "User"}: ${turn.text}`)
+    .join("\n");
+}
+
+// Silently append the transcript to the session (no agent run). The session may
+// not exist yet on a call that never triggered a consult, so on "not found" we
+// create it (no run) and retry once. `continued` marks a rolling follow-up
+// inject so the session reads as one transcript split across messages.
+async function appendTranscriptSilently(
+  gateway: GatewayClient,
+  sessionKey: string,
+  transcript: string,
+  continued: boolean,
+) {
+  const header = continued ? "[Voice call transcript (continued)]" : "[Voice call transcript]";
+  const params = {
+    sessionKey,
+    message: `${header}\n${transcript}`,
+    label: "voice-transcript",
+  };
+  try {
+    await gateway.request("chat.inject", params, 5000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/not.?found|unknown session|no such session/i.test(message)) throw error;
+    // The session does not exist yet (no consult happened this call): create
+    // it without starting a run, then retry the append.
+    await gateway.request("sessions.create", { key: sessionKey }, 5000);
+    await gateway.request("chat.inject", params, 5000);
+  }
+}
+
+// Opt-in: run one agent turn at hang-up that stores memories from the call.
+// chat.send starts a durable server-side run (it acks immediately and creates
+// the session if needed). The transcript itself now reaches the session via the
+// rolling [Voice call transcript] injects, so when those already ran
+// (`injectedEarlier`) this turn only carries the not-yet-injected tail plus a
+// pointer to the injected messages; otherwise it carries the full transcript
+// as before.
+async function persistWithMemoryTurn(
+  gateway: GatewayClient,
+  sessionKey: string,
+  transcript: string,
+  injectedEarlier: boolean,
+) {
+  const message = [
+    "[Voice call ended]",
+    ...(injectedEarlier
+      ? [
+          "The transcript of the voice call that just ended is in the preceding [Voice call transcript] messages.",
+          ...(transcript ? ["", "Final turns not yet included there:", "", transcript] : []),
+        ]
+      : ["Transcript of the voice call that just ended:", "", transcript]),
+    "",
+    "Store anything worth remembering long-term, following your normal memory practice. No spoken reply is needed.",
+  ].join("\n");
+  await gateway.request(
+    "chat.send",
+    { sessionKey, message, idempotencyKey: `voice-flush-${sessionKey}-${crypto.randomUUID()}` },
+    5000,
+  );
 }
 
 // oxlint-disable-next-line react-doctor/no-giant-component, react-doctor/prefer-useReducer
@@ -195,8 +291,19 @@ export default function App() {
   // realtime session and mirrored to storage. Replayed into a fresh session on
   // reconnect/resume so the model picks the conversation back up.
   const transcriptRef = useRef<ReplayTurn[]>([]);
+  // Debounce timer for the rolling transcript flush — reset on every captured
+  // turn so a rapid exchange lands as one inject.
+  const flushTimerRef = useRef<number | null>(null);
+  // Replaced for each user-started call and retained over reconnects. Keeping
+  // the write chain and watermarks per call prevents a slow write from an ended
+  // call mutating the next call's persistence state.
+  const persistenceStateRef = useRef<TranscriptPersistenceState>({
+    flushedTurnCount: 0,
+    injected: false,
+    chain: null,
+  });
   // The sessionKey the current call resolved to, so captured turns persist under
-  // the right key even when it was auto-resolved (settings.sessionKey empty).
+  // the right internally minted key.
   const sessionKeyRef = useRef<string>("");
   // Consecutive auto-reconnect attempts since the last stable connection. Reset
   // to 0 once a reconnect reaches "listening"; capped by MAX_RECONNECT_ATTEMPTS.
@@ -240,17 +347,35 @@ export default function App() {
     saveSettings();
     setShowSettings(false);
     reconnectAttemptsRef.current = 0;
+    // A new call gets a fresh transcript-message header; a stale debounce from
+    // the previous call must not fire into this one. (Reconnects go through
+    // establishCall directly and deliberately keep both.)
+    cancelScheduledFlush();
 
     let sessionKeyOverride: string | undefined;
+    let flushedTurnCount = 0;
     if (mode === "resume") {
       const stored = loadConversation();
       transcriptRef.current = stored ? [...stored.turns] : [];
+      const storedFlushedTurnCount =
+        typeof stored?.flushedTurnCount === "number" && Number.isFinite(stored.flushedTurnCount)
+          ? stored.flushedTurnCount
+          : 0;
+      flushedTurnCount = Math.max(
+        0,
+        Math.min(transcriptRef.current.length, storedFlushedTurnCount),
+      );
       sessionKeyOverride = stored?.sessionKey || undefined;
     } else {
       transcriptRef.current = [];
       clearConversation();
       setResumeAvailable(false);
     }
+    persistenceStateRef.current = {
+      flushedTurnCount,
+      injected: false,
+      chain: null,
+    };
 
     try {
       await establishCall({ replayTurns: [...transcriptRef.current], sessionKeyOverride });
@@ -265,10 +390,7 @@ export default function App() {
   // realtime session with `replayTurns` so a resume/reconnect continues the
   // conversation. `sessionKeyOverride` pins the session key (used by resume and
   // reconnect); otherwise it auto-resolves from settings/agents.list.
-  async function establishCall(opts: {
-    replayTurns: ReplayTurn[];
-    sessionKeyOverride?: string;
-  }) {
+  async function establishCall(opts: { replayTurns: ReplayTurn[]; sessionKeyOverride?: string }) {
     teardownCall();
     setStatus("connecting");
     setDetail("Opening gateway");
@@ -296,19 +418,21 @@ export default function App() {
       log(`Session-event subscribe failed (tool activity may be hidden): ${String(error)}`);
     }
 
-    const sessionKey = await resolveSessionKey(
-      gateway,
-      opts.sessionKeyOverride ?? settings.sessionKey,
-    );
+    const sessionKey = await resolveSessionKey(gateway, opts.sessionKeyOverride ?? "");
+    const agentId = parseAgentIdFromSessionKey(sessionKey) ?? (await resolveMainAgentId(gateway));
+    // Hold the resolved key for this call so captured turns and the end-of-call
+    // flush target it. Deliberately not written back to Settings: persisting a
+    // minted key would pin every later call to it, defeating one-session-per-call.
+    // The key still survives a drop (reconnect reuses sessionKeyRef) and a resume
+    // (saveConversation stores it alongside the transcript).
     sessionKeyRef.current = sessionKey;
-    if (sessionKey !== settings.sessionKey) updateSettings({ sessionKey });
 
     setDetail("Setting up voice");
     const voiceSession = await createVoiceSessionWithRetry(
       gateway,
       {
         sessionKey,
-        agentId: "main",
+        agentId,
       },
       (attempt) => {
         setDetail(`Retrying setup (${attempt}/3)`);
@@ -323,6 +447,7 @@ export default function App() {
     const call = new OpenAIRealtimeCall(
       gateway,
       sessionKey,
+      agentId,
       voiceSession,
       {
         onStatus: (next, nextDetail = "") => {
@@ -364,8 +489,86 @@ export default function App() {
     const text = entry.text.trim();
     if (!text) return;
     transcriptRef.current.push({ role: entry.role, text });
-    saveConversation(sessionKeyRef.current, transcriptRef.current);
+    saveConversation(
+      sessionKeyRef.current,
+      transcriptRef.current,
+      persistenceStateRef.current.flushedTurnCount,
+    );
     setResumeAvailable(true);
+    scheduleTranscriptFlush();
+  }
+
+  // Debounced rolling persistence: flush the not-yet-flushed turns into the
+  // OpenClaw session a beat after the latest captured turn, so the session
+  // tracks the call as it happens instead of only at hang-up. The timer resets
+  // per turn; the actual flush is chained on the per-call persistence state so
+  // a slow inject can never interleave with (or be overtaken by) the next one.
+  function scheduleTranscriptFlush() {
+    if (flushTimerRef.current !== null) window.clearTimeout(flushTimerRef.current);
+    flushTimerRef.current = window.setTimeout(() => {
+      flushTimerRef.current = null;
+      const gateway = gatewayRef.current;
+      // Only flush while the gateway is live and a call session key exists —
+      // otherwise leave the turns unflushed for the next flush (or hang-up).
+      if (!gateway?.connected || !sessionKeyRef.current) return;
+      const state = persistenceStateRef.current;
+      const sessionKey = sessionKeyRef.current;
+      const turns = transcriptRef.current;
+      state.chain = (state.chain ?? Promise.resolve()).then(() =>
+        flushPendingTurnsToSession(gateway, sessionKey, turns, state),
+      );
+    }, TRANSCRIPT_FLUSH_DEBOUNCE_MS);
+  }
+
+  function cancelScheduledFlush() {
+    if (flushTimerRef.current === null) return;
+    window.clearTimeout(flushTimerRef.current);
+    flushTimerRef.current = null;
+  }
+
+  // The incremental-flush core: append the turns captured since the last flush
+  // to the OpenClaw session via the silent chat.inject path (never chat.send
+  // mid-call). The watermark advances only after the gateway acknowledges the
+  // append, so a later rolling or hang-up flush retries any failed batch.
+  async function flushPendingTurnsToSession(
+    gateway: GatewayClient,
+    sessionKey: string,
+    turns: ReplayTurn[],
+    state: TranscriptPersistenceState,
+  ) {
+    if (!sessionKey) return;
+    const targetTurnCount = turns.length;
+    const unflushedTurns = turns.slice(state.flushedTurnCount, targetTurnCount);
+    if (unflushedTurns.length === 0) return;
+    const continued = state.injected;
+    try {
+      await appendTranscriptSilently(
+        gateway,
+        sessionKey,
+        formatTranscriptLines(unflushedTurns),
+        continued,
+      );
+      state.flushedTurnCount = targetTurnCount;
+      state.injected = true;
+      saveConversationIfCurrent(sessionKey, turns, state);
+    } catch (error) {
+      log(`Rolling transcript persist failed: ${String(error)}`);
+    }
+  }
+
+  function saveConversationIfCurrent(
+    sessionKey: string,
+    turns: ReplayTurn[],
+    state: TranscriptPersistenceState,
+  ) {
+    if (
+      persistenceStateRef.current !== state ||
+      transcriptRef.current !== turns ||
+      sessionKeyRef.current !== sessionKey
+    ) {
+      return;
+    }
+    saveConversation(sessionKey, turns, state.flushedTurnCount);
   }
 
   // Silently rebuilds the call after a drop, replaying the captured transcript
@@ -374,6 +577,12 @@ export default function App() {
   async function attemptReconnect(state: string) {
     const turns = transcriptRef.current;
     if (turns.length === 0 || reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      // The call is over for good — best-effort flush of any turns the rolling
+      // persistence hasn't sent (the realtime side already committed pending
+      // speech into transcriptRef before reporting the loss). The gateway WS is
+      // separate from the WebRTC leg, so it is often still alive here; bounded
+      // inside flushTranscriptToSession so the error screen isn't held up.
+      await flushTranscriptToSession(gatewayRef.current);
       teardownCall();
       raiseFatalError("Connection lost", describeConnectionLoss(state));
       return;
@@ -384,6 +593,8 @@ export default function App() {
     setStatus("connecting");
     setDetail(`Reconnecting (${attempt}/${MAX_RECONNECT_ATTEMPTS})…`);
     log(`Connection ${state}; reconnecting (attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS})`);
+    // The guard reads a ref that can flip during the backoff delay, so it must run after it.
+    // oxlint-disable-next-line react-doctor/async-defer-await
     await delay(750 * attempt);
     if (!wantCallRef.current) return; // hung up while waiting to retry
     try {
@@ -417,13 +628,75 @@ export default function App() {
     log(`${title}: ${reason}`);
   }
 
-  function stopCall() {
+  async function stopCall() {
+    const gateway = gatewayRef.current;
     wantCallRef.current = false;
     callSounds.ended();
-    teardownCall();
+    // Stop audio/mic and settle the UI right away so hang-up feels instant...
+    callRef.current?.stop();
+    callRef.current = null;
+    setStreams([]);
+    setMuted(false);
     setStatus("idle");
     setDetail("");
+    // ...but keep the socket open just long enough to hand this call's transcript
+    // to the gateway for the memory flush, then drop it. Bounded inside
+    // flushTranscriptToSession so a slow gateway can't stall the disconnect.
+    await flushTranscriptToSession(gateway);
+    gateway?.disconnect();
+    if (gatewayRef.current === gateway) gatewayRef.current = null;
     log("Call ended");
+  }
+
+  // On hang-up (or a call that dropped for good), persist whatever the rolling
+  // flush hasn't sent yet into the OpenClaw session so it survives the call and
+  // is referenceable later — the session is a recall source, and memory
+  // dreaming (if enabled) can promote it. Usually a near no-op now: the rolling
+  // injects have already carried the transcript. Best-effort: a failure here
+  // must never surface as a call error, and we cap the wait so hang-up stays
+  // snappy.
+  async function flushTranscriptToSession(gateway: GatewayClient | null) {
+    // The debounced rolling flush must not fire after teardown into a dead (or
+    // worse, the next call's) gateway.
+    cancelScheduledFlush();
+    const sessionKey = sessionKeyRef.current;
+    const turns = transcriptRef.current;
+    if (!gateway || !sessionKey || turns.length === 0) return;
+    const state = persistenceStateRef.current;
+    // chat.inject appends the transcript to the session with NO agent turn (no
+    // reply, no wasted tokens). chat.send is used only when memory recording is
+    // enabled, since actively storing memories needs an agent turn. Chained
+    // onto the rolling-flush queue so this final write can't overtake or
+    // interleave with a rolling inject still in flight. Determine the tail only
+    // after earlier writes settle so a successful rolling append is not sent
+    // twice and a failed one is retried here.
+    const request = (state.chain ?? Promise.resolve()).then(async () => {
+      const targetTurnCount = turns.length;
+      const unflushedTurns = turns.slice(state.flushedTurnCount, targetTurnCount);
+      const injectedEarlier = state.injected;
+      // Nothing new this call at all (no unflushed tail and no rolling injects
+      // to summarize a memory turn over) — skip entirely.
+      if (unflushedTurns.length === 0 && !(RECORD_MEMORIES && injectedEarlier)) return;
+      const transcript = formatTranscriptLines(unflushedTurns);
+      if (RECORD_MEMORIES) {
+        await persistWithMemoryTurn(gateway, sessionKey, transcript, injectedEarlier);
+      } else {
+        await appendTranscriptSilently(gateway, sessionKey, transcript, injectedEarlier);
+        state.injected = true;
+      }
+      state.flushedTurnCount = targetTurnCount;
+      saveConversationIfCurrent(sessionKey, turns, state);
+    });
+    state.chain = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    // These ack as soon as the write starts / run starts, so this resolves fast;
+    // the cap is just a safety net so a stalled socket can't hold up disconnect.
+    await Promise.race([
+      request.catch((error) => log(`Transcript persist failed: ${String(error)}`)),
+      delay(1500),
+    ]);
   }
 
   function toggleMute() {
@@ -453,7 +726,11 @@ export default function App() {
   // that has aged past the resume TTL stops being offered (hasResumableConversation
   // drops a stale record). The freshly-ended call's record is still within the
   // window here, so the normal post-hang-up flow keeps offering Resume.
+  // Deliberately an effect, not per-handler calls: "idle" is reached from several
+  // paths (hang-up, error dismissal, the call's onStatus callback) and the check
+  // is wall-clock TTL-dependent, so one central re-evaluation is the robust shape.
   useEffect(() => {
+    // oxlint-disable-next-line react-doctor/no-event-handler, react-doctor/no-chain-state-updates
     if (status === "idle") setResumeAvailable(hasResumableConversation());
   }, [status]);
 
@@ -610,11 +887,7 @@ export default function App() {
             </>
           ) : resumeAvailable ? (
             <>
-              <button
-                type="button"
-                className="callButton call"
-                onClick={() => startCall("resume")}
-              >
+              <button type="button" className="callButton call" onClick={() => startCall("resume")}>
                 <Phone size={22} />
                 Resume conversation
               </button>
@@ -684,14 +957,6 @@ export default function App() {
                   />
                 </label>
               </div>
-              <label>
-                <span>Session key</span>
-                <input
-                  placeholder="Auto from agents.list"
-                  value={settings.sessionKey}
-                  onChange={(event) => updateSettings({ sessionKey: event.target.value })}
-                />
-              </label>
               <button className="saveButton" type="submit">
                 {saved ? "Saved" : "Save"}
               </button>
@@ -703,18 +968,36 @@ export default function App() {
   );
 }
 
+// Resolves the sessionKey for a call. A stored key carried by resume/reconnect
+// is honored verbatim.
+// Otherwise a *new* call mints a fresh session under the main agent: a unique
+// suffix so each call is its own conversation thread, while the agent (and its
+// long-term memory) stays the same across calls. Nothing is minted back into
+// Settings, so the next new call mints again — one session per call.
 async function resolveSessionKey(gateway: GatewayClient, explicit: string) {
   const trimmed = explicit.trim();
   if (trimmed) return trimmed;
+  const agentId = await resolveMainAgentId(gateway);
+  return `agent:${agentId}:direct:sureclaw-voice-${crypto.randomUUID()}`;
+}
+
+function parseAgentIdFromSessionKey(sessionKey: string): string | undefined {
+  const parts = sessionKey.split(":");
+  return parts[0] === "agent" && parts[1] ? parts[1] : undefined;
+}
+
+// Derives the configured main agent's id from agents.list so a minted session
+// key attaches to the real main agent even when it isn't literally "main".
+// Falls back to "main" if the lookup fails or returns nothing usable.
+async function resolveMainAgentId(gateway: GatewayClient): Promise<string> {
   try {
-    const agents = (await gateway.request("agents.list", {}, 10000)) as {
-      mainKey?: string;
-    };
-    if (agents.mainKey?.trim()) return agents.mainKey.trim();
+    const agents = (await gateway.request("agents.list", {}, 10000)) as { defaultId?: string };
+    const defaultId = agents.defaultId?.trim();
+    if (defaultId) return defaultId;
   } catch {
-    // The Gateway will still accept an explicit fallback session key.
+    // Fall back to the conventional id below.
   }
-  return "agent:main:direct:openclaw-voice-pwa";
+  return "main";
 }
 
 async function createVoiceSessionWithRetry(

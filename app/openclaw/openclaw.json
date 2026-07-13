@@ -29,7 +29,7 @@
           "realtime": {
             "enabled": true,
             "provider": "openai",
-            "model": "gpt-realtime-2",
+            "model": "gpt-realtime-2.1",
             "voice": "alloy",
             "toolPolicy": "owner",
             "consultPolicy": "always",

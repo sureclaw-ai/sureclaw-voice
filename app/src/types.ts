@@ -4,7 +4,6 @@ export type GatewaySettings = {
   gatewayUrl: string;
   authMode: GatewayAuthMode;
   secret: string;
-  sessionKey: string;
 };
 
 export type GatewayEvent = {

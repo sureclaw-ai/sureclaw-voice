@@ -7,7 +7,7 @@ const sw = self;
 // which replaces the BUILD_HASH token with a hash of the bundled JS/CSS. This
 // means the cache is automatically busted whenever app content changes — no
 // manual version bump required.
-const CACHE_NAME = "openclaw-voice-b3ab7224b0cf";
+const CACHE_NAME = "openclaw-voice-4a28c993d4de";
 // Relative to the service worker's scope so the app shell caches correctly
 // whether it's served from the site root or a mount path (e.g. /voice/).
 const APP_SHELL = [
@@ -42,7 +42,7 @@ sw.addEventListener("fetch", (event) => {
 				caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
 			}
 			return response;
-		}).catch(async () => await caches.match(request) ?? await caches.match("./") ?? Response.error()));
+		}).catch(async () => await caches.match(request) ?? await caches.match("./") ?? await caches.match("./offline.html") ?? Response.error()));
 		return;
 	}
 	// Other same-origin GETs: stale-while-revalidate, but never cache errors or

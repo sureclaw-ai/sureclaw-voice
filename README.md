@@ -49,7 +49,7 @@ Everything is optional except a usable `realtime.provider` — without one,
         "realtime": {
           "enabled": true,
           "provider": "openai",          // a registered realtime voice provider
-          "model": "gpt-realtime-2",     // required — no provider default
+          "model": "gpt-realtime-2.1",     // required — no provider default
           "voice": "alloy",              // provider default if omitted
           "toolPolicy": "owner",         // safe-read-only | owner | none
           // consultPolicy is the behavioral dial:

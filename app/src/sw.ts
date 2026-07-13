@@ -50,7 +50,10 @@ sw.addEventListener("fetch", (event) => {
         })
         .catch(
           async () =>
-            (await caches.match(request)) ?? (await caches.match("./")) ?? Response.error(),
+            (await caches.match(request)) ??
+            (await caches.match("./")) ??
+            (await caches.match("./offline.html")) ??
+            Response.error(),
         ),
     );
     return;

@@ -62,7 +62,8 @@ const entry = definePluginEntry({
 				additionalProperties: false,
 				properties: {
 					path: { type: "string" },
-					name: { type: "string" }
+					name: { type: "string" },
+					recordMemoriesOnCallEnd: { type: "boolean" }
 				}
 			},
 			realtime: {
@@ -206,11 +207,17 @@ function registerWebappRoute(api) {
 		return;
 	}
 	const configuredName = webapp?.name?.trim();
+	const assistantName = (configuredName || "OpenClaw").slice(0, 60);
+	const productTitle = (configuredName || "SureClaw Voice").slice(0, 60);
+	const homeScreenLabel = (configuredName || "SureClaw Voice").slice(0, 60);
+	const gatewayAuthMode = api.config?.gateway?.auth?.mode ?? "token";
+	const recordMemories = webapp?.recordMemoriesOnCallEnd === true;
 	const tokens = {
-		__APP_NAME__: (configuredName || "OpenClaw").slice(0, 60),
-		__APP_FULL_NAME__: (configuredName || "SureClaw Voice").slice(0, 60),
-		__APP_SHORT_NAME__: (configuredName || "SureClaw Voice").slice(0, 60),
-		__APP_GATEWAY_AUTH__: api.config?.gateway?.auth?.mode ?? "token"
+		__APP_NAME__: assistantName,
+		__APP_FULL_NAME__: productTitle,
+		__APP_SHORT_NAME__: homeScreenLabel,
+		__APP_GATEWAY_AUTH__: gatewayAuthMode,
+		__APP_RECORD_MEMORIES__: String(recordMemories)
 	};
 	const mount = normalizeWebappMount(webapp?.path ?? DEFAULT_WEBAPP_MOUNT);
 	api.registerHttpRoute({
@@ -237,7 +244,17 @@ async function serveWebappFile(req, res, mount, root, tokens) {
 	const method = (req.method ?? "GET").toUpperCase();
 	if (method !== "GET" && method !== "HEAD") return false;
 	const url = new URL(req.url ?? "/", "http://localhost");
-	const pathname = decodeURIComponent(url.pathname);
+	let pathname;
+	try {
+		pathname = decodeURIComponent(url.pathname);
+	} catch (error) {
+		if (error instanceof URIError) {
+			res.statusCode = 400;
+			res.end("Bad request");
+			return true;
+		}
+		throw error;
+	}
 	if (pathname === mount) {
 		res.statusCode = 307;
 		res.setHeader("Location", `${mount}/${url.search}`);
@@ -267,7 +284,7 @@ async function serveWebappFile(req, res, mount, root, tokens) {
 	let body;
 	if (isTokenized) {
 		const raw = await readFile(filePath, "utf8");
-		body = Buffer.from(replaceTokens(raw, tokens), "utf8");
+		body = Buffer.from(replaceTokens(raw, tokens, ext), "utf8");
 	} else body = await readFile(filePath);
 	res.statusCode = 200;
 	res.setHeader("Content-Type", contentType);
@@ -279,11 +296,28 @@ async function serveWebappFile(req, res, mount, root, tokens) {
 	res.end(body);
 	return true;
 }
-function replaceTokens(input, tokens) {
+function replaceTokens(input, tokens, ext) {
 	if (!input.includes("__APP_")) return input;
+	const escapedTokens = escapeTokensForExtension(tokens, ext);
 	let out = input;
-	for (const [key, value] of Object.entries(tokens)) out = out.split(key).join(value);
+	for (const [key, value] of Object.entries(escapedTokens)) out = out.split(key).join(value);
 	return out;
+}
+function escapeTokensForExtension(tokens, ext) {
+	const escapeValue = ext === ".webmanifest" ? (value) => JSON.stringify(value).slice(1, -1) : escapeHtmlTokenValue;
+	return Object.fromEntries(Object.entries(tokens).map(([key, value]) => [key, escapeValue(value)]));
+}
+function escapeHtmlTokenValue(value) {
+	return value.replace(/[&<>"']/g, (char) => {
+		switch (char) {
+			case "&": return "&amp;";
+			case "<": return "&lt;";
+			case ">": return "&gt;";
+			case "\"": return "&quot;";
+			case "'": return "&#39;";
+			default: return char;
+		}
+	});
 }
 async function resolveIceServers(webrtc) {
 	if (!webrtc) return void 0;
@@ -309,6 +343,7 @@ async function generateCloudflareTurn(keyId, apiToken, ttlSeconds) {
 			Authorization: `Bearer ${apiToken}`,
 			"Content-Type": "application/json"
 		},
+		signal: AbortSignal.timeout(1e4),
 		body: JSON.stringify({ ttl: ttlSeconds })
 	});
 	if (!response.ok) throw new Error(`Cloudflare TURN API responded ${response.status}: ${(await response.text()).slice(0, 200)}`);

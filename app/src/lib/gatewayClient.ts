@@ -21,6 +21,24 @@ export class GatewayClient {
   connect(): Promise<unknown> {
     this.disconnect();
     this.helloPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      let connectTimeout: number | undefined;
+      const settleResolve = (value: unknown) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(connectTimeout);
+        resolve(value);
+      };
+      const settleReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(connectTimeout);
+        reject(error);
+      };
+      connectTimeout = window.setTimeout(
+        () => settleReject(new Error("Gateway connect timed out")),
+        15000,
+      );
       const ws = new WebSocket(this.url);
       this.ws = ws;
 
@@ -35,8 +53,8 @@ export class GatewayClient {
         if (frame.type === "event") {
           if (frame.event === "connect.challenge") {
             this.request("connect", this.buildConnectParams(frame.payload), 15000).then(
-              resolve,
-              reject,
+              settleResolve,
+              settleReject,
             );
             return;
           }
@@ -57,14 +75,20 @@ export class GatewayClient {
         }
       });
 
-      ws.addEventListener("error", () => reject(new Error("Gateway WebSocket failed")));
+      ws.addEventListener("error", () => settleReject(new Error("Gateway WebSocket failed")));
       ws.addEventListener("close", (event) => {
         this.flushPending(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
-        if (!event.wasClean && this.helloPromise)
-          reject(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
+        if (!settled)
+          settleReject(new Error(`Gateway closed (${event.code}) ${event.reason}`.trim()));
       });
     });
     return this.helloPromise;
+  }
+
+  // Whether the WebSocket is currently open — used to skip best-effort work
+  // (e.g. the rolling transcript flush) that would only reject while offline.
+  get connected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
   }
 
   disconnect() {
@@ -104,7 +128,7 @@ export class GatewayClient {
       client: {
         id: "openclaw-control-ui",
         displayName: "OpenClaw Voice PWA",
-        version: "0.1.3",
+        version: __PLUGIN_VERSION__,
         platform: "web",
         mode: "ui",
       },

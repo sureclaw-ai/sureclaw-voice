@@ -26,6 +26,10 @@ const RESUME_TTL_MS = 30 * 60 * 1000;
 export type StoredConversation = {
   sessionKey: string;
   turns: ReplayTurn[];
+  // Number of leading `turns` confirmed persisted to the OpenClaw session.
+  // Missing on older records is treated as zero so resume favors a harmless
+  // duplicate over silently losing a locally captured turn.
+  flushedTurnCount?: number;
   updatedAt: number;
 };
 
@@ -55,11 +59,19 @@ export function hasResumableConversation(): boolean {
   return read() !== null;
 }
 
-export function saveConversation(sessionKey: string, turns: ReplayTurn[]) {
+export function saveConversation(sessionKey: string, turns: ReplayTurn[], flushedTurnCount = 0) {
   if (turns.length === 0) return;
+  const firstStoredIndex = Math.max(0, turns.length - MAX_TURNS);
+  const storedTurns = turns.slice(firstStoredIndex);
   const stored: StoredConversation = {
     sessionKey,
-    turns: turns.slice(-MAX_TURNS),
+    turns: storedTurns,
+    // The watermark is relative to the cropped stored buffer, not the full
+    // in-memory transcript.
+    flushedTurnCount: Math.max(
+      0,
+      Math.min(storedTurns.length, flushedTurnCount - firstStoredIndex),
+    ),
     updatedAt: Date.now(),
   };
   try {

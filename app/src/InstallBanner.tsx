@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown, Plus, Share, SquarePlus, X } from "lucide-react";
 
 // A slim, top-of-screen hint that nudges mobile users to install the PWA to
@@ -58,6 +58,7 @@ export function InstallBanner({ appName }: { appName: string }) {
   const [standalone, setStandalone] = useState(isStandalone);
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [guideOpen, setGuideOpen] = useState(false);
+  const guideDialogRef = useRef<HTMLDialogElement>(null);
 
   // Capture Android/Chrome's install prompt so our own button can trigger it,
   // and hide the banner the moment the app gets installed.
@@ -87,6 +88,14 @@ export function InstallBanner({ appName }: { appName: string }) {
     };
   }, [guideOpen]);
 
+  useLayoutEffect(() => {
+    if (!guideOpen || PLATFORM !== "ios") return;
+    const dialog = guideDialogRef.current;
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+    }
+  }, [guideOpen]);
+
   if (!PLATFORM || standalone || dismissed) return null;
 
   function dismiss() {
@@ -108,6 +117,14 @@ export function InstallBanner({ appName }: { appName: string }) {
     setDeferredPrompt(null);
   }
 
+  function closeGuide() {
+    const dialog = guideDialogRef.current;
+    if (dialog?.open) {
+      dialog.close();
+    }
+    setGuideOpen(false);
+  }
+
   return (
     <>
       <section className="installBanner" aria-label="Install app">
@@ -116,9 +133,7 @@ export function InstallBanner({ appName }: { appName: string }) {
           {PLATFORM === "android" && deferredPrompt ? (
             <>Install {appName} for a full-screen, app-like experience.</>
           ) : PLATFORM === "ios" ? (
-            <>
-              Add {appName} to your Home Screen for one-tap access.
-            </>
+            <>Add {appName} to your Home Screen for one-tap access.</>
           ) : (
             <>
               Install {appName}: open the browser menu, then <strong>Add to Home screen</strong>.
@@ -151,16 +166,17 @@ export function InstallBanner({ appName }: { appName: string }) {
       </section>
 
       {guideOpen && PLATFORM === "ios" && (
-        <div
+        <dialog
+          ref={guideDialogRef}
           className="installGuide"
-          role="dialog"
-          aria-modal="true"
           aria-label={`Install ${appName}`}
+          onCancel={() => setGuideOpen(false)}
+          onClose={() => setGuideOpen(false)}
         >
           <div className="installGuide__card">
             <button
               className="installGuide__close"
-              onClick={() => setGuideOpen(false)}
+              onClick={closeGuide}
               aria-label="Close"
               type="button"
             >
@@ -199,16 +215,12 @@ export function InstallBanner({ appName }: { appName: string }) {
               <li className="installGuide__step">
                 <span className="installGuide__num">3</span>
                 <span className="installGuide__stepText">
-                  Tap <strong>Add</strong> in the top-right corner — done!
+                  Tap <strong>Add</strong> in the top-right corner to finish.
                 </span>
               </li>
             </ol>
 
-            <button
-              className="installGuide__done"
-              onClick={() => setGuideOpen(false)}
-              type="button"
-            >
+            <button className="installGuide__done" onClick={closeGuide} type="button">
               Got it
             </button>
           </div>
@@ -218,7 +230,7 @@ export function InstallBanner({ appName }: { appName: string }) {
             <span className="installGuide__pointerLabel">Share button is down here</span>
             <ChevronDown size={28} className="installGuide__pointerArrow" />
           </div>
-        </div>
+        </dialog>
       )}
     </>
   );

@@ -102,6 +102,13 @@ type WebappConfig = {
   // Display name shown in the page title, manifest, and the Call button.
   // Defaults to "OpenClaw" (full name "OpenClaw Voice").
   name?: string;
+  // Whether, on hang-up, the client also runs one agent turn to store memories
+  // from the call (via chat.send). Off by default: the transcript is always
+  // appended to the session silently (via chat.inject — no agent turn, no reply),
+  // and that session is already a recall source and dreamable, so per-call memory
+  // extraction is opt-in. Turn this on to have the agent actively write memories
+  // at the end of every call (costs one agent turn per call).
+  recordMemoriesOnCallEnd?: boolean;
 };
 
 type PluginConfig = {
@@ -184,6 +191,7 @@ const entry = definePluginEntry({
         properties: {
           path: { type: "string" },
           name: { type: "string" },
+          recordMemoriesOnCallEnd: { type: "boolean" },
         },
       },
       // Realtime voice config (provider, model, voice, instructions, tool/consult
@@ -418,11 +426,15 @@ function registerWebappRoute(api: {
   // hides its Settings sheet entirely. Default to "token" when unset — that
   // is the gateway's own default for an unconfigured auth mode.
   const gatewayAuthMode = api.config?.gateway?.auth?.mode ?? "token";
+  // Whether the client runs an end-of-call agent turn to store memories. Off
+  // unless explicitly enabled (the transcript itself is always persisted).
+  const recordMemories = webapp?.recordMemoriesOnCallEnd === true;
   const tokens: Record<string, string> = {
     __APP_NAME__: assistantName,
     __APP_FULL_NAME__: productTitle,
     __APP_SHORT_NAME__: homeScreenLabel,
     __APP_GATEWAY_AUTH__: gatewayAuthMode,
+    __APP_RECORD_MEMORIES__: String(recordMemories),
   };
 
   // Serve-only: the gateway authenticates the WebSocket itself (token or
@@ -466,7 +478,17 @@ async function serveWebappFile(
   if (method !== "GET" && method !== "HEAD") return false;
 
   const url = new URL(req.url ?? "/", "http://localhost");
-  const pathname = decodeURIComponent(url.pathname);
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch (error) {
+    if (error instanceof URIError) {
+      res.statusCode = 400;
+      res.end("Bad request");
+      return true;
+    }
+    throw error;
+  }
 
   // Redirect the bare mount to a trailing slash so the relative asset URLs in
   // index.html resolve under the mount (…/voice/assets/… not /assets/…).
@@ -516,7 +538,7 @@ async function serveWebappFile(
   let body: Buffer;
   if (isTokenized) {
     const raw = await readFile(filePath, "utf8");
-    body = Buffer.from(replaceTokens(raw, tokens), "utf8");
+    body = Buffer.from(replaceTokens(raw, tokens, ext), "utf8");
   } else {
     body = await readFile(filePath);
   }
@@ -536,15 +558,45 @@ async function serveWebappFile(
   return true;
 }
 
-// Replaces __APP_NAME__ / __APP_FULL_NAME__ tokens in the served HTML/manifest.
+// Replaces __APP_*__ tokens in the served HTML/manifest. Values stay raw in the
+// shared token map and are escaped per file type here: HTML attributes/text need
+// entity escaping, while manifest string values need JSON string escaping.
 // Only touches text payloads (see isTokenized), so binary assets are untouched.
-function replaceTokens(input: string, tokens: Record<string, string>): string {
+function replaceTokens(input: string, tokens: Record<string, string>, ext: string): string {
   if (!input.includes("__APP_")) return input;
+  const escapedTokens = escapeTokensForExtension(tokens, ext);
   let out = input;
-  for (const [key, value] of Object.entries(tokens)) {
+  for (const [key, value] of Object.entries(escapedTokens)) {
     out = out.split(key).join(value);
   }
   return out;
+}
+
+function escapeTokensForExtension(tokens: Record<string, string>, ext: string): Record<string, string> {
+  const escapeValue =
+    ext === ".webmanifest"
+      ? (value: string) => JSON.stringify(value).slice(1, -1)
+      : escapeHtmlTokenValue;
+  return Object.fromEntries(Object.entries(tokens).map(([key, value]) => [key, escapeValue(value)]));
+}
+
+function escapeHtmlTokenValue(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return char;
+    }
+  });
 }
 
 // Resolves the ICE (STUN/TURN) servers handed to the browser for this session.
@@ -600,6 +652,7 @@ async function generateCloudflareTurn(
         Authorization: `Bearer ${apiToken}`,
         "Content-Type": "application/json",
       },
+      signal: AbortSignal.timeout(10000),
       body: JSON.stringify({ ttl: ttlSeconds }),
     },
   );

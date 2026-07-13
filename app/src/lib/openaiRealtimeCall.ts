@@ -8,6 +8,7 @@ import type {
 import { GatewayClient } from "./gatewayClient";
 
 type RealtimeEvent = Record<string, unknown> & { type?: string };
+type TurnDetectionConfig = Record<string, unknown>;
 
 // The OpenClaw `chat` "final" payload's `message` can arrive as a plain string,
 // an array of content parts (e.g. OpenAI-style `[{ type: "text", text: "..." }]`
@@ -121,6 +122,12 @@ export class OpenAIRealtimeCall {
   // live tool detail instead of clobbering it with a generic string.
   private consultDetail = "";
   private turnDetectionSuspended = false;
+  // Baseline from the provider's session.created/session.updated events. Treat
+  // it as opaque so custom VAD settings (thresholds, semantic_vad, timings)
+  // survive the temporary tool-call suspension round trip.
+  // `undefined` means no baseline event has arrived; `null` means the provider
+  // explicitly disabled turn detection.
+  private turnDetectionConfig: TurnDetectionConfig | null | undefined;
   // The assistant transcript accumulated from `response.audio_transcript.delta`
   // for the in-progress response. A turn is normally committed on the matching
   // `.done`, but an abrupt drop (real or simulated) can land before `.done`
@@ -132,6 +139,7 @@ export class OpenAIRealtimeCall {
   constructor(
     private readonly gateway: GatewayClient,
     private readonly sessionKey: string,
+    private readonly agentId: string,
     private readonly session: RealtimeBrowserSession,
     private readonly callbacks: CallCallbacks,
     // Prior dialogue turns to seed into this session before the user speaks, so
@@ -164,9 +172,17 @@ export class OpenAIRealtimeCall {
     });
     this.peer.addEventListener("connectionstatechange", () => this.handleConnectionStateChange());
 
-    this.media = await navigator.mediaDevices.getUserMedia({
+    const media = await navigator.mediaDevices.getUserMedia({
       audio: { autoGainControl: true, echoCancellation: true, noiseSuppression: true },
     });
+    // The user can hang up while any setup await is pending. In the mic case,
+    // the stream was acquired after stop() already ran, so release it before
+    // bailing instead of assigning it to a now-closed call.
+    if (this.closed) {
+      media.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    this.media = media;
     this.media.getAudioTracks().forEach((track) => this.peer?.addTrack(track, this.media!));
     this.callbacks.onStream?.("mic", this.media);
 
@@ -178,8 +194,12 @@ export class OpenAIRealtimeCall {
     });
     this.channel.addEventListener("message", (event) => this.handleRealtimeEvent(event.data));
 
+    // oxlint-disable react-doctor/async-defer-await -- `closed` can flip during
+    // each await (user hangs up mid-setup), so the guards must run after them.
     const offer = await this.peer.createOffer();
+    if (this.closed) return;
     await this.peer.setLocalDescription(offer);
+    if (this.closed) return;
 
     const offerUrl = this.session.offerUrl || "https://api.openai.com/v1/realtime/calls";
     this.callbacks.onLog(`Posting WebRTC offer to ${offerUrl}`);
@@ -192,7 +212,9 @@ export class OpenAIRealtimeCall {
         "Content-Type": "application/sdp",
       },
     });
+    if (this.closed) return;
     const responseText = await response.text();
+    if (this.closed) return;
     if (!response.ok) {
       const detail = formatHttpErrorDetail(responseText);
       throw new Error(
@@ -200,6 +222,8 @@ export class OpenAIRealtimeCall {
       );
     }
     await this.peer.setRemoteDescription({ type: "answer", sdp: responseText });
+    if (this.closed) return;
+    // oxlint-enable react-doctor/async-defer-await
   }
 
   // Seed the fresh session with the prior conversation so the model resumes
@@ -225,7 +249,8 @@ export class OpenAIRealtimeCall {
       });
       replayed += 1;
     }
-    if (replayed > 0) this.callbacks.onLog(`Replayed ${replayed} prior turns to resume the conversation`);
+    if (replayed > 0)
+      this.callbacks.onLog(`Replayed ${replayed} prior turns to resume the conversation`);
   }
 
   private handleConnectionStateChange() {
@@ -375,15 +400,25 @@ export class OpenAIRealtimeCall {
     if (!eventType.endsWith(".delta")) console.debug(`${LOG_PREFIX} ← recv ${eventType}`, event);
 
     switch (event.type) {
+      case "session.created":
+      case "session.updated":
+        this.captureTurnDetectionConfig(event);
+        return;
       case "conversation.item.input_audio_transcription.completed":
         this.pushTranscript("user", stringField(event, "transcript"));
         return;
+      // Beta and GA names for the same assistant-transcript stream: the beta
+      // API emits `response.audio_transcript.*`, the GA API (session type
+      // "realtime", which we configure) emits `response.output_audio_transcript.*`.
+      // Handle both so assistant speech is captured regardless of API surface.
       case "response.audio_transcript.delta":
+      case "response.output_audio_transcript.delta":
         // Accumulate the running assistant transcript so an abrupt drop before
         // `.done` can still flush the in-progress turn (see reportConnectionLost).
         this.pendingAssistantTranscript += stringField(event, "delta") || "";
         return;
       case "response.audio_transcript.done":
+      case "response.output_audio_transcript.done":
         // The `.done` payload is the authoritative full transcript; commit it and
         // drop the running accumulation so it can't be double-flushed on loss.
         this.pendingAssistantTranscript = "";
@@ -454,6 +489,17 @@ export class OpenAIRealtimeCall {
         this.callbacks.onStatus(this.responseActive ? "thinking" : "listening");
         return;
       }
+    }
+  }
+
+  private captureTurnDetectionConfig(event: RealtimeEvent) {
+    // Ignore our own suspension update; otherwise the temporary
+    // create_response=false/interrupt_response=false payload becomes the
+    // "baseline" and permanently clobbers custom server or semantic VAD config.
+    if (this.turnDetectionSuspended) return;
+    const config = extractTurnDetectionConfig(event.session);
+    if (config !== undefined) {
+      this.turnDetectionConfig = config === null ? null : { ...config };
     }
   }
 
@@ -534,19 +580,27 @@ export class OpenAIRealtimeCall {
     if (this.turnDetectionSuspended) return;
     this.turnDetectionSuspended = true;
     // Disable automatic responses/interruption (explicit response.create still
-    // works), and drop any buffered partial speech so it cannot fire the moment
-    // we resume.
+    // works) while preserving the session's actual VAD shape, and drop any
+    // buffered partial speech so it cannot fire the moment we resume.
+    const turnDetection =
+      this.turnDetectionConfig === null
+        ? null
+        : {
+            ...(this.turnDetectionConfig ?? {
+              type: "server_vad",
+              create_response: true,
+              interrupt_response: true,
+            }),
+            create_response: false,
+            interrupt_response: false,
+          };
     this.send({
       type: "session.update",
       session: {
         type: "realtime",
         audio: {
           input: {
-            turn_detection: {
-              type: "server_vad",
-              create_response: false,
-              interrupt_response: false,
-            },
+            turn_detection: turnDetection,
           },
         },
       },
@@ -568,13 +622,17 @@ export class OpenAIRealtimeCall {
       return;
     }
     this.turnDetectionSuspended = false;
+    const turnDetection =
+      this.turnDetectionConfig === undefined
+        ? { type: "server_vad", create_response: true, interrupt_response: true }
+        : this.turnDetectionConfig;
     this.send({
       type: "session.update",
       session: {
         type: "realtime",
         audio: {
           input: {
-            turn_detection: { type: "server_vad", create_response: true, interrupt_response: true },
+            turn_detection: turnDetection,
           },
         },
       },
@@ -594,7 +652,7 @@ export class OpenAIRealtimeCall {
     });
     const response = (await this.gateway.request("browserVoice.consult", {
       sessionKey: this.sessionKey,
-      agentId: "main",
+      agentId: this.agentId,
       args,
     })) as { text?: string };
     this.callbacks.onLog("fast_context lookup complete");
@@ -627,15 +685,6 @@ export class OpenAIRealtimeCall {
 
   private waitForChatFinal(runId: string, signal: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
-      // TEMP diagnostic: tally every gateway event the consult observes so we
-      // can see (at console.log level, since debug is often hidden) whether the
-      // agent's `tool` stream actually reaches this client and under what runId.
-      const eventTally = new Map<string, number>();
-      const toolNames = new Set<string>();
-      const agentRunIds = new Set<string>();
-      // First-seen shape per event kind, so we can tell whether tool calls are
-      // hiding inside assistant/item frames rather than a dedicated tool stream.
-      const shapeByKey = new Map<string, string>();
       const timeout = window.setTimeout(() => {
         console.warn(
           `${LOG_PREFIX} consult TIMEOUT after 120s (runId=${runId}) — no chat 'final' event arrived`,
@@ -645,26 +694,12 @@ export class OpenAIRealtimeCall {
       const abort = () =>
         cleanup(() => reject(new DOMException("OpenClaw consult aborted", "AbortError")));
       const unsubscribe = this.gateway.addEventListener((event: GatewayEvent) => {
-        const p = (event.payload ?? {}) as { stream?: unknown; runId?: unknown; data?: unknown };
-        const tallyKey =
-          event.event === "agent" && typeof p.stream === "string"
-            ? `agent:${p.stream}`
-            : event.event;
-        eventTally.set(tallyKey, (eventTally.get(tallyKey) ?? 0) + 1);
-        if (event.event === "agent" && typeof p.runId === "string") agentRunIds.add(p.runId);
-        if (!shapeByKey.has(tallyKey)) {
-          const d = p.data;
-          const dataKeys =
-            d && typeof d === "object" ? Object.keys(d as Record<string, unknown>).join("|") : typeof d;
-          shapeByKey.set(tallyKey, `{${dataKeys}}`);
-        }
         // The agent streams its tool activity as `session.tool` events (to
         // session-event subscribers) and, for runs we're a registered recipient
         // of, as `agent` events with stream "tool". Surface whichever arrives so
         // the caller sees "Running bash…" instead of a generic wait.
         if (event.event === "session.tool" || event.event === "agent") {
-          const toolName = this.noteConsultToolActivity(runId, event.payload);
-          if (toolName) toolNames.add(toolName);
+          this.noteConsultToolActivity(runId, event.payload);
           return;
         }
         if (event.event !== "chat") return;
@@ -681,8 +716,7 @@ export class OpenAIRealtimeCall {
           payload,
         );
         if (chat.runId !== runId) return;
-        if (chat.state === "final")
-          cleanup(() => resolve(extractChatMessage(chat.message)));
+        if (chat.state === "final") cleanup(() => resolve(extractChatMessage(chat.message)));
         if (chat.state === "aborted")
           cleanup(() =>
             reject(new DOMException(chat.errorMessage || "OpenClaw aborted", "AbortError")),
@@ -697,10 +731,6 @@ export class OpenAIRealtimeCall {
         window.clearTimeout(timeout);
         signal.removeEventListener("abort", abort);
         unsubscribe();
-        // TEMP diagnostic summary (visible at console.log level).
-        console.log(
-          `${LOG_PREFIX} consult summary: events=${JSON.stringify(Object.fromEntries(eventTally))} shapes=${JSON.stringify(Object.fromEntries(shapeByKey))} tools=[${[...toolNames].join(", ")}] agentRunIds=[${[...agentRunIds].join(", ")}] consultRunId=${runId}`,
-        );
         finish();
       };
     });
@@ -789,6 +819,25 @@ function humanizeToolName(name: string): string {
 function stringField(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function extractTurnDetectionConfig(session: unknown): TurnDetectionConfig | null | undefined {
+  const sessionRecord = recordValue(session);
+  const audio = recordValue(sessionRecord?.audio);
+  const input = recordValue(audio?.input);
+  if (input && Object.hasOwn(input, "turn_detection")) {
+    return input.turn_detection === null ? null : recordValue(input.turn_detection);
+  }
+  if (sessionRecord && Object.hasOwn(sessionRecord, "turn_detection")) {
+    return sessionRecord.turn_detection === null ? null : recordValue(sessionRecord.turn_detection);
+  }
+  return undefined;
 }
 
 function safeJson(raw: string) {
