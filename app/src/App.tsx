@@ -978,7 +978,12 @@ async function resolveSessionKey(gateway: GatewayClient, explicit: string) {
   const trimmed = explicit.trim();
   if (trimmed) return trimmed;
   const agentId = await resolveMainAgentId(gateway);
-  return `agent:${agentId}:direct:sureclaw-voice-${crypto.randomUUID()}`;
+  // Key under the `voice` channel so OpenClaw-native tooling (session/cost views,
+  // the token-usage rollup) buckets these as voice without special-casing. The
+  // `agent:<id>:` prefix is kept deliberately: it binds the session to the main
+  // agent's store, which is what shares long-term memory across calls — a bare
+  // `voice:` key carries no agent identity and would fall back to default routing.
+  return `agent:${agentId}:voice:sureclaw-${crypto.randomUUID()}`;
 }
 
 function parseAgentIdFromSessionKey(sessionKey: string): string | undefined {
