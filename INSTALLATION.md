@@ -127,11 +127,13 @@ artifacts (`dist/` and `webapp/`) — no build step runs on install.
 
 **Ask the operator for these two things; everything else gets a sensible default.**
 
-1. **Voice** — offer the OpenAI realtime voices and let them pick:
+1. **Provider + voice** — default to OpenAI and offer its realtime voices:
    `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`,
    `marin`, `cedar`. Recommend `alloy` if they have no preference. Point them at
    the voice guide to hear the differences:
-   <https://sureclaw.com.au/guides/choosing-an-openai-realtime-voice>.
+   <https://sureclaw.com.au/guides/choosing-an-openai-realtime-voice>. If they
+   prefer xAI Grok Voice, use provider `xai` and offer `eve` (default), `ara`,
+   `rex`, `sal`, or `leo` instead.
 2. **Name** — the display name shown in the title and on the Call button (e.g.
    their agent's name). Optional; defaults to `OpenClaw`.
 
@@ -185,6 +187,20 @@ in). Don't make the operator decide on any of the rest; just set it.
 
 Restart the gateway after writing the config. Without a usable `realtime.provider`,
 `browserVoice.create` returns `UNAVAILABLE` and calls won't connect.
+
+For xAI, replace the provider/model/voice and credential block above with:
+
+```jsonc
+"provider": "xai",
+"model": "grok-voice-latest",
+"voice": "eve",
+"providers": {
+  "xai": { "apiKey": "xai-…" } // or set XAI_API_KEY in the gateway env
+}
+```
+
+The gateway mints a short-lived xAI client secret, so `XAI_API_KEY` never
+reaches the PWA. xAI uses a direct TLS WebSocket rather than WebRTC.
 
 > **If you want `fast_context` to recall from past sessions, not just memory:**
 > listing `"sessions"` in `fastContext.sources` above is *not* enough on its own
@@ -255,9 +271,11 @@ trusted-proxy mode:
 
 ## Step 6 — TURN relay (offer it contextually)
 
-A TURN relay makes calls reliable on mobile/5G and restrictive networks where
-plain peer-to-peer WebRTC fails. It's optional — without it, calls fall back to
-public STUN and work fine on most home/office networks. Cloudflare provides TURN.
+A TURN relay makes OpenAI WebRTC calls reliable on mobile/5G and restrictive
+networks where plain peer-to-peer WebRTC fails. It's optional — without it,
+calls fall back to public STUN and work fine on most home/office networks.
+Cloudflare provides TURN. xAI calls do not need TURN because they use a direct
+TLS WebSocket.
 
 **Read the situation before asking:**
 

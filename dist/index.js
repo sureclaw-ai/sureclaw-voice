@@ -5,11 +5,16 @@ import { fileURLToPath } from "node:url";
 import { resolveAgentIdentity } from "openclaw/plugin-sdk/agent-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { REALTIME_BOOTSTRAP_CONTEXT_FILE_NAMES, resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
-import { REALTIME_VOICE_AGENT_CONSULT_TOOL, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy, resolveRealtimeVoiceFastContextConsult } from "openclaw/plugin-sdk/realtime-voice";
+import { REALTIME_VOICE_AGENT_CONSULT_TOOL, REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ, resolveConfiguredRealtimeVoiceProvider, resolveRealtimeVoiceAgentConsultToolPolicy, resolveRealtimeVoiceFastContextConsult } from "openclaw/plugin-sdk/realtime-voice";
 //#region index.ts
 const DEFAULT_AGENT_CONTEXT_MAX_CHARS = 6e3;
 const CF_TURN_API_TOKEN_ENV = "CF_TURN_API_TOKEN";
 const PLUGIN_ID = "sureclaw-voice";
+const XAI_REALTIME_PROVIDER_ID = "xai";
+const XAI_REALTIME_DEFAULT_MODEL = "grok-voice-latest";
+const XAI_REALTIME_DEFAULT_VOICE = "eve";
+const XAI_REALTIME_DEFAULT_BASE_URL = "https://api.x.ai/v1";
+const XAI_REALTIME_CLIENT_SECRET_TTL_SECONDS = 300;
 const REALTIME_FAST_CONTEXT_TOOL = {
 	type: "function",
 	name: "fast_context",
@@ -34,10 +39,166 @@ function resolveBrowserRealtimeConfig(cfg) {
 	if (!realtime || realtime.enabled === false) return void 0;
 	return realtime;
 }
+function buildXaiRealtimeVoiceProvider() {
+	return {
+		id: XAI_REALTIME_PROVIDER_ID,
+		label: "xAI Grok Voice",
+		defaultModel: XAI_REALTIME_DEFAULT_MODEL,
+		models: [XAI_REALTIME_DEFAULT_MODEL, "grok-voice-think-fast-1.0"],
+		autoSelectOrder: 20,
+		capabilities: {
+			transports: ["provider-websocket"],
+			inputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ],
+			outputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ],
+			supportsBrowserSession: true,
+			supportsBargeIn: true,
+			supportsToolCalls: true
+		},
+		resolveConfig: ({ rawConfig }) => normalizeXaiRealtimeProviderConfig(rawConfig),
+		isConfigured: ({ providerConfig }) => Boolean(normalizeXaiRealtimeProviderConfig(providerConfig).apiKey || readEnv("XAI_API_KEY")?.trim()),
+		createBridge: () => {
+			throw new Error("xAI realtime voice is available to this plugin through the browser provider-websocket transport only");
+		},
+		createBrowserSession: async (req) => {
+			const config = normalizeXaiRealtimeProviderConfig(req.providerConfig);
+			const apiKey = config.apiKey || readEnv("XAI_API_KEY")?.trim();
+			if (!apiKey) throw new Error("xAI credentials missing for realtime voice; set providers.xai.apiKey or XAI_API_KEY");
+			const model = req.model?.trim() || config.model || XAI_REALTIME_DEFAULT_MODEL;
+			const voice = req.voice?.trim() || config.voice || XAI_REALTIME_DEFAULT_VOICE;
+			const baseUrl = normalizeXaiRealtimeBaseUrl(config.baseUrl);
+			const clientSecret = await createXaiRealtimeClientSecret({
+				baseUrl,
+				apiKey
+			});
+			const turnDetection = { type: "server_vad" };
+			const vadThreshold = req.vadThreshold ?? config.vadThreshold;
+			const silenceDurationMs = req.silenceDurationMs ?? config.silenceDurationMs;
+			const prefixPaddingMs = req.prefixPaddingMs ?? config.prefixPaddingMs;
+			if (typeof vadThreshold === "number") turnDetection.threshold = vadThreshold;
+			if (typeof silenceDurationMs === "number") turnDetection.silence_duration_ms = silenceDurationMs;
+			if (typeof prefixPaddingMs === "number") turnDetection.prefix_padding_ms = prefixPaddingMs;
+			const sessionConfig = {
+				voice,
+				instructions: req.instructions,
+				turn_detection: turnDetection,
+				audio: {
+					input: {
+						format: {
+							type: "audio/pcm",
+							rate: 24e3
+						},
+						transport: "json",
+						transcription: { model: "grok-transcribe" }
+					},
+					output: {
+						format: {
+							type: "audio/pcm",
+							rate: 24e3
+						},
+						transport: "json"
+					}
+				}
+			};
+			if (req.tools?.length) sessionConfig.tools = req.tools;
+			const reasoningEffort = req.reasoningEffort?.trim() || config.reasoningEffort;
+			if (reasoningEffort) sessionConfig.reasoning = { effort: reasoningEffort };
+			return {
+				provider: XAI_REALTIME_PROVIDER_ID,
+				transport: "provider-websocket",
+				protocol: "xai-realtime",
+				clientSecret: clientSecret.value,
+				websocketUrl: buildXaiRealtimeWebSocketUrl(baseUrl, model),
+				audio: {
+					inputEncoding: "pcm16",
+					inputSampleRateHz: 24e3,
+					outputEncoding: "pcm16",
+					outputSampleRateHz: 24e3
+				},
+				initialMessage: {
+					type: "session.update",
+					session: sessionConfig
+				},
+				model,
+				voice,
+				expiresAt: clientSecret.expiresAt
+			};
+		}
+	};
+}
+function normalizeXaiRealtimeProviderConfig(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const config = value;
+	return {
+		apiKey: trimmedString(config.apiKey),
+		baseUrl: trimmedString(config.baseUrl),
+		model: trimmedString(config.model),
+		voice: trimmedString(config.voice),
+		vadThreshold: finiteNumber(config.vadThreshold),
+		silenceDurationMs: finiteNumber(config.silenceDurationMs),
+		prefixPaddingMs: finiteNumber(config.prefixPaddingMs),
+		reasoningEffort: trimmedString(config.reasoningEffort)
+	};
+}
+function normalizeXaiRealtimeBaseUrl(value) {
+	const url = new URL(value || XAI_REALTIME_DEFAULT_BASE_URL);
+	if (url.protocol !== "https:") throw new Error("xAI realtime baseUrl must use https://");
+	url.search = "";
+	url.hash = "";
+	return url.toString().replace(/\/$/, "");
+}
+function buildXaiRealtimeWebSocketUrl(baseUrl, model) {
+	const url = new URL(`${baseUrl}/realtime`);
+	url.protocol = "wss:";
+	url.searchParams.set("model", model);
+	return url.toString();
+}
+async function createXaiRealtimeClientSecret(params) {
+	const response = await fetch(`${params.baseUrl}/realtime/client_secrets`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${params.apiKey}`,
+			"Content-Type": "application/json"
+		},
+		body: JSON.stringify({ expires_after: { seconds: XAI_REALTIME_CLIENT_SECRET_TTL_SECONDS } }),
+		signal: AbortSignal.timeout(1e4)
+	});
+	const responseText = await response.text();
+	if (!response.ok) throw new Error(`xAI realtime client-secret request failed (${response.status})${responseText.trim() ? `: ${formatProviderHttpError(responseText)}` : ""}`);
+	let data;
+	try {
+		data = JSON.parse(responseText);
+	} catch {
+		throw new Error("xAI realtime client-secret response was not valid JSON");
+	}
+	if (typeof data.value !== "string" || !data.value.trim()) throw new Error("xAI realtime client-secret response did not include a token");
+	return {
+		value: data.value,
+		expiresAt: typeof data.expires_at === "number" ? data.expires_at : void 0
+	};
+}
+function trimmedString(value) {
+	return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function finiteNumber(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function formatProviderHttpError(body) {
+	const redacted = body.trim().replace(/(Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/giu, "$1 [redacted]");
+	try {
+		const error = JSON.parse(redacted).error;
+		const parts = [
+			typeof error?.message === "string" ? error.message : "",
+			typeof error?.code === "string" ? `code=${error.code}` : "",
+			typeof error?.type === "string" ? `type=${error.type}` : ""
+		].filter(Boolean);
+		if (parts.length) return parts.join(" ");
+	} catch {}
+	return redacted.slice(0, 500);
+}
 const entry = definePluginEntry({
 	id: "sureclaw-voice",
 	name: "SureClaw Voice",
-	description: "Serves the voice web app and mints browser WebRTC realtime sessions from the plugin's own realtime voice config.",
+	description: "Serves the voice web app and mints OpenAI or xAI browser realtime sessions from the plugin's own config.",
 	configSchema: {
 		type: "object",
 		additionalProperties: false,
@@ -75,6 +236,7 @@ const entry = definePluginEntry({
 		}
 	},
 	register(api) {
+		api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
 		registerWebappRoute(api);
 		api.registerGatewayMethod("browserVoice.create", async ({ params, respond, context }) => {
 			const typedParams = normalizeParams(params);
@@ -133,7 +295,7 @@ const entry = definePluginEntry({
 					model: realtimeConfig.model,
 					voice: realtimeConfig.voice
 				});
-				const iceServers = await resolveIceServers(cfg.plugins?.entries?.[PLUGIN_ID]?.config?.webrtc);
+				const iceServers = session.transport === "webrtc" ? await resolveIceServers(cfg.plugins?.entries?.[PLUGIN_ID]?.config?.webrtc) : void 0;
 				respond(true, iceServers ? {
 					...session,
 					iceServers
@@ -382,7 +544,7 @@ function normalizeConsultParams(value) {
 function resolveFastContextConfig(config) {
 	return {
 		enabled: config?.enabled ?? false,
-		timeoutMs: config?.timeoutMs ?? 800,
+		timeoutMs: config?.timeoutMs ?? 1e3,
 		maxResults: config?.maxResults ?? 3,
 		sources: config?.sources ?? ["memory", "sessions"],
 		fallbackToConsult: config?.fallbackToConsult ?? false

@@ -1,10 +1,11 @@
 # SureClaw Voice
 
-An OpenClaw plugin that lets you **call your OpenClaw from the browser** over
-WebRTC. The plugin serves a small voice PWA from the gateway's own HTTP server
-and mints browser realtime voice sessions, so a **single origin** handles both
-the HTTPS page and the WSS gateway connection — put cloudflared (or any HTTPS
-terminator) in front of the gateway port and you're done.
+An OpenClaw plugin that lets you **call your OpenClaw from the browser** using
+OpenAI Realtime or xAI Grok Voice. The plugin serves a small voice PWA from the
+gateway's own HTTP server and mints browser realtime voice sessions, so a
+**single origin** handles both the HTTPS page and the WSS gateway connection —
+put cloudflared (or any HTTPS terminator) in front of the gateway port and
+you're done.
 
 - App at `https://<host>/voice`, WebSocket back to `wss://<host>` — same origin.
 - Realtime voice config lives in the plugin's own config under
@@ -101,6 +102,39 @@ Everything is optional except a usable `realtime.provider` — without one,
   }
 }
 ```
+
+### xAI Grok Voice alternative
+
+Use `provider: "xai"` to connect the browser directly to the [xAI Voice Agent
+API](https://docs.x.ai/developers/model-capabilities/audio/voice-agent) over its
+PCM WebSocket transport. The gateway exchanges `XAI_API_KEY` for a short-lived
+client secret; the long-lived API key is never sent to the browser.
+
+```jsonc
+"realtime": {
+  "enabled": true,
+  "provider": "xai",
+  "model": "grok-voice-latest",
+  "voice": "eve",
+  "consultPolicy": "always",
+  "toolPolicy": "owner",
+  "agentContext": { "enabled": true },
+  "fastContext": { "enabled": true },
+  "providers": {
+    "xai": {
+      // "apiKey": "xai-…",              // or set XAI_API_KEY in the gateway env
+      // "reasoningEffort": "high",      // "high" or "none"
+      // "baseUrl": "https://api.x.ai/v1"
+    }
+  }
+}
+```
+
+xAI's built-in voice IDs are `eve` (default), `ara`, `rex`, `sal`, and `leo`;
+custom voice IDs are also accepted. `grok-voice-latest` tracks xAI's current
+recommended voice model; use `grok-voice-think-fast-1.0` to pin the current
+version. TURN configuration applies only to OpenAI's WebRTC transport and is
+ignored for xAI's direct WebSocket transport.
 
 > **Two consult tools.** When `fastContext.enabled`, the voice model is given
 > two tools and chooses between them: **`fast_context`** — a bounded memory/

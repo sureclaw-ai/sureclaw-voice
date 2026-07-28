@@ -12,7 +12,9 @@ import {
 } from "openclaw/plugin-sdk/realtime-bootstrap-context";
 import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL,
+  REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ,
   type RealtimeVoiceFastContextConfig,
+  type RealtimeVoiceProviderPlugin,
   type RealtimeVoiceTool,
   resolveConfiguredRealtimeVoiceProvider,
   resolveRealtimeVoiceAgentConsultToolPolicy,
@@ -124,6 +126,11 @@ type RuntimeConfig = {
 };
 
 const PLUGIN_ID = "sureclaw-voice";
+const XAI_REALTIME_PROVIDER_ID = "xai";
+const XAI_REALTIME_DEFAULT_MODEL = "grok-voice-latest";
+const XAI_REALTIME_DEFAULT_VOICE = "eve";
+const XAI_REALTIME_DEFAULT_BASE_URL = "https://api.x.ai/v1";
+const XAI_REALTIME_CLIENT_SECRET_TTL_SECONDS = 300;
 
 // Second model-facing tool, exposed alongside openclaw_agent_consult when
 // fastContext is enabled. The model calls this for quick recall (memory/past
@@ -157,11 +164,206 @@ function resolveBrowserRealtimeConfig(cfg: RuntimeConfig): RealtimeVoiceConfig |
   return realtime;
 }
 
+type XaiRealtimeProviderConfig = {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  voice?: string;
+  vadThreshold?: number;
+  silenceDurationMs?: number;
+  prefixPaddingMs?: number;
+  reasoningEffort?: string;
+};
+
+function buildXaiRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin {
+  return {
+    id: XAI_REALTIME_PROVIDER_ID,
+    label: "xAI Grok Voice",
+    defaultModel: XAI_REALTIME_DEFAULT_MODEL,
+    models: [XAI_REALTIME_DEFAULT_MODEL, "grok-voice-think-fast-1.0"],
+    autoSelectOrder: 20,
+    capabilities: {
+      transports: ["provider-websocket"],
+      inputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ],
+      outputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_PCM16_24KHZ],
+      supportsBrowserSession: true,
+      supportsBargeIn: true,
+      supportsToolCalls: true,
+    },
+    resolveConfig: ({ rawConfig }) => normalizeXaiRealtimeProviderConfig(rawConfig),
+    isConfigured: ({ providerConfig }) =>
+      Boolean(
+        normalizeXaiRealtimeProviderConfig(providerConfig).apiKey || readEnv("XAI_API_KEY")?.trim(),
+      ),
+    createBridge: () => {
+      throw new Error(
+        "xAI realtime voice is available to this plugin through the browser provider-websocket transport only",
+      );
+    },
+    createBrowserSession: async (req) => {
+      const config = normalizeXaiRealtimeProviderConfig(req.providerConfig);
+      const apiKey = config.apiKey || readEnv("XAI_API_KEY")?.trim();
+      if (!apiKey) {
+        throw new Error(
+          "xAI credentials missing for realtime voice; set providers.xai.apiKey or XAI_API_KEY",
+        );
+      }
+
+      const model = req.model?.trim() || config.model || XAI_REALTIME_DEFAULT_MODEL;
+      const voice = req.voice?.trim() || config.voice || XAI_REALTIME_DEFAULT_VOICE;
+      const baseUrl = normalizeXaiRealtimeBaseUrl(config.baseUrl);
+      const clientSecret = await createXaiRealtimeClientSecret({ baseUrl, apiKey });
+
+      const turnDetection: Record<string, unknown> = { type: "server_vad" };
+      const vadThreshold = req.vadThreshold ?? config.vadThreshold;
+      const silenceDurationMs = req.silenceDurationMs ?? config.silenceDurationMs;
+      const prefixPaddingMs = req.prefixPaddingMs ?? config.prefixPaddingMs;
+      if (typeof vadThreshold === "number") turnDetection.threshold = vadThreshold;
+      if (typeof silenceDurationMs === "number") {
+        turnDetection.silence_duration_ms = silenceDurationMs;
+      }
+      if (typeof prefixPaddingMs === "number") turnDetection.prefix_padding_ms = prefixPaddingMs;
+
+      const sessionConfig: Record<string, unknown> = {
+        voice,
+        instructions: req.instructions,
+        turn_detection: turnDetection,
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24000 },
+            transport: "json",
+            transcription: { model: "grok-transcribe" },
+          },
+          output: {
+            format: { type: "audio/pcm", rate: 24000 },
+            transport: "json",
+          },
+        },
+      };
+      if (req.tools?.length) sessionConfig.tools = req.tools;
+      const reasoningEffort = req.reasoningEffort?.trim() || config.reasoningEffort;
+      if (reasoningEffort) sessionConfig.reasoning = { effort: reasoningEffort };
+
+      return {
+        provider: XAI_REALTIME_PROVIDER_ID,
+        transport: "provider-websocket",
+        protocol: "xai-realtime",
+        clientSecret: clientSecret.value,
+        websocketUrl: buildXaiRealtimeWebSocketUrl(baseUrl, model),
+        audio: {
+          inputEncoding: "pcm16",
+          inputSampleRateHz: 24000,
+          outputEncoding: "pcm16",
+          outputSampleRateHz: 24000,
+        },
+        initialMessage: { type: "session.update", session: sessionConfig },
+        model,
+        voice,
+        expiresAt: clientSecret.expiresAt,
+      };
+    },
+  };
+}
+
+function normalizeXaiRealtimeProviderConfig(value: unknown): XaiRealtimeProviderConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const config = value as Record<string, unknown>;
+  return {
+    apiKey: trimmedString(config.apiKey),
+    baseUrl: trimmedString(config.baseUrl),
+    model: trimmedString(config.model),
+    voice: trimmedString(config.voice),
+    vadThreshold: finiteNumber(config.vadThreshold),
+    silenceDurationMs: finiteNumber(config.silenceDurationMs),
+    prefixPaddingMs: finiteNumber(config.prefixPaddingMs),
+    reasoningEffort: trimmedString(config.reasoningEffort),
+  };
+}
+
+function normalizeXaiRealtimeBaseUrl(value?: string): string {
+  const url = new URL(value || XAI_REALTIME_DEFAULT_BASE_URL);
+  if (url.protocol !== "https:") throw new Error("xAI realtime baseUrl must use https://");
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/, "");
+}
+
+function buildXaiRealtimeWebSocketUrl(baseUrl: string, model: string): string {
+  const url = new URL(`${baseUrl}/realtime`);
+  url.protocol = "wss:";
+  url.searchParams.set("model", model);
+  return url.toString();
+}
+
+async function createXaiRealtimeClientSecret(params: { baseUrl: string; apiKey: string }) {
+  const response = await fetch(`${params.baseUrl}/realtime/client_secrets`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${params.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      expires_after: { seconds: XAI_REALTIME_CLIENT_SECRET_TTL_SECONDS },
+    }),
+    signal: AbortSignal.timeout(10000),
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `xAI realtime client-secret request failed (${response.status})${
+        responseText.trim() ? `: ${formatProviderHttpError(responseText)}` : ""
+      }`,
+    );
+  }
+
+  let data: { value?: unknown; expires_at?: unknown };
+  try {
+    data = JSON.parse(responseText) as { value?: unknown; expires_at?: unknown };
+  } catch {
+    throw new Error("xAI realtime client-secret response was not valid JSON");
+  }
+  if (typeof data.value !== "string" || !data.value.trim()) {
+    throw new Error("xAI realtime client-secret response did not include a token");
+  }
+  return {
+    value: data.value,
+    expiresAt: typeof data.expires_at === "number" ? data.expires_at : undefined,
+  };
+}
+
+function trimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatProviderHttpError(body: string): string {
+  const trimmed = body.trim();
+  const redacted = trimmed.replace(/(Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/giu, "$1 [redacted]");
+  try {
+    const parsed = JSON.parse(redacted) as {
+      error?: { message?: unknown; code?: unknown; type?: unknown };
+    };
+    const error = parsed.error;
+    const parts = [
+      typeof error?.message === "string" ? error.message : "",
+      typeof error?.code === "string" ? `code=${error.code}` : "",
+      typeof error?.type === "string" ? `type=${error.type}` : "",
+    ].filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  } catch {
+    // Fall through to a bounded plaintext response.
+  }
+  return redacted.slice(0, 500);
+}
+
 const entry = definePluginEntry({
   id: "sureclaw-voice",
   name: "SureClaw Voice",
   description:
-    "Serves the voice web app and mints browser WebRTC realtime sessions from the plugin's own realtime voice config.",
+    "Serves the voice web app and mints OpenAI or xAI browser realtime sessions from the plugin's own config.",
 
   // Plugin config schema. The relay (STUN/TURN) settings live here under the
   // plugin's own `config` slot rather than in the host realtime block, which
@@ -210,6 +412,12 @@ const entry = definePluginEntry({
   },
 
   register(api) {
+    // OpenClaw does not currently register xAI's upstream Voice Agent API as a
+    // realtime-voice provider. Register the browser-native WebSocket path here
+    // so the same provider selection/config flow used by OpenAI can select xAI.
+    // The browser receives only a short-lived client secret, never the API key.
+    api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
+
     registerWebappRoute(api);
 
     api.registerGatewayMethod("browserVoice.create", async ({ params, respond, context }) => {
@@ -290,7 +498,10 @@ const entry = definePluginEntry({
           voice: realtimeConfig.voice,
         });
 
-        const iceServers = await resolveIceServers(cfg.plugins?.entries?.[PLUGIN_ID]?.config?.webrtc);
+        const iceServers =
+          session.transport === "webrtc"
+            ? await resolveIceServers(cfg.plugins?.entries?.[PLUGIN_ID]?.config?.webrtc)
+            : undefined;
         respond(true, iceServers ? { ...session, iceServers } : session, undefined);
       } catch (error) {
         respond(false, undefined, {
@@ -396,7 +607,10 @@ function registerWebappRoute(api: {
     path: string;
     auth: "plugin" | "gateway";
     match?: "exact" | "prefix";
-    handler: (req: IncomingMessage, res: ServerResponse) => Promise<boolean | void> | boolean | void;
+    handler: (
+      req: IncomingMessage,
+      res: ServerResponse,
+    ) => Promise<boolean | void> | boolean | void;
   }) => void;
 }) {
   const webapp = api.pluginConfig?.webapp;
@@ -572,12 +786,17 @@ function replaceTokens(input: string, tokens: Record<string, string>, ext: strin
   return out;
 }
 
-function escapeTokensForExtension(tokens: Record<string, string>, ext: string): Record<string, string> {
+function escapeTokensForExtension(
+  tokens: Record<string, string>,
+  ext: string,
+): Record<string, string> {
   const escapeValue =
     ext === ".webmanifest"
       ? (value: string) => JSON.stringify(value).slice(1, -1)
       : escapeHtmlTokenValue;
-  return Object.fromEntries(Object.entries(tokens).map(([key, value]) => [key, escapeValue(value)]));
+  return Object.fromEntries(
+    Object.entries(tokens).map(([key, value]) => [key, escapeValue(value)]),
+  );
 }
 
 function escapeHtmlTokenValue(value: string): string {
@@ -658,7 +877,9 @@ async function generateCloudflareTurn(
   );
 
   if (!response.ok) {
-    throw new Error(`Cloudflare TURN API responded ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    throw new Error(
+      `Cloudflare TURN API responded ${response.status}: ${(await response.text()).slice(0, 200)}`,
+    );
   }
 
   const data = (await response.json()) as {
@@ -670,7 +891,8 @@ async function generateCloudflareTurn(
 }
 
 function readEnv(name: string): string | undefined {
-  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process
+    ?.env;
   return env?.[name];
 }
 
@@ -702,7 +924,7 @@ function resolveFastContextConfig(
 ): RealtimeVoiceFastContextConfig {
   return {
     enabled: config?.enabled ?? false,
-    timeoutMs: config?.timeoutMs ?? 800,
+    timeoutMs: config?.timeoutMs ?? 1000,
     maxResults: config?.maxResults ?? 3,
     sources: config?.sources ?? ["memory", "sessions"],
     fallbackToConsult: config?.fallbackToConsult ?? false,
@@ -849,10 +1071,14 @@ function buildRealtimeInstructions(params: {
 }) {
   const base =
     params.instructions ??
-    ["You are OpenClaw's voice interface.", "Keep spoken replies concise, natural, and suitable for a live voice call."].join(
-      "\n",
-    );
-  const consultPolicyInstructions = buildConsultPolicyInstructions(params.toolPolicy, params.consultPolicy);
+    [
+      "You are OpenClaw's voice interface.",
+      "Keep spoken replies concise, natural, and suitable for a live voice call.",
+    ].join("\n");
+  const consultPolicyInstructions = buildConsultPolicyInstructions(
+    params.toolPolicy,
+    params.consultPolicy,
+  );
   // Only describe fast_context when it is actually exposed as a tool.
   const fastContextInstructions =
     params.fastContextEnabled && params.toolPolicy !== "none"
@@ -905,15 +1131,21 @@ function buildConsultPolicyInstructions(toolPolicy: string, consultPolicy: strin
   ];
 
   if (consultPolicy === "always") {
-    policyLines.push("For substantive user turns, call openclaw_agent_consult before giving the final spoken answer.");
+    policyLines.push(
+      "For substantive user turns, call openclaw_agent_consult before giving the final spoken answer.",
+    );
   } else if (consultPolicy === "auto") {
-    policyLines.push("For simple greetings or short acknowledgements, answer directly. For anything substantive, consult OpenClaw first.");
+    policyLines.push(
+      "For simple greetings or short acknowledgements, answer directly. For anything substantive, consult OpenClaw first.",
+    );
   }
 
   if (toolPolicy === "safe-read-only") {
     policyLines.push("The consult tool may be limited to safe read-only work.");
   } else if (toolPolicy === "owner") {
-    policyLines.push("The consult tool may perform owner-authorized OpenClaw work according to the server policy.");
+    policyLines.push(
+      "The consult tool may perform owner-authorized OpenClaw work according to the server policy.",
+    );
   }
 
   return policyLines.join(" ");

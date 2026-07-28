@@ -9,7 +9,7 @@ import type {
   TranscriptEntry,
 } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
-import { OpenAIRealtimeCall } from "./lib/openaiRealtimeCall";
+import { BrowserRealtimeCall } from "./lib/openaiRealtimeCall";
 import {
   clearConversation,
   hasResumableConversation,
@@ -286,7 +286,7 @@ export default function App() {
   // captured / cleared. Drives the idle Resume-vs-Start-new choice.
   const [resumeAvailable, setResumeAvailable] = useState(() => hasResumableConversation());
   const gatewayRef = useRef<GatewayClient | null>(null);
-  const callRef = useRef<OpenAIRealtimeCall | null>(null);
+  const callRef = useRef<BrowserRealtimeCall | null>(null);
   // The live transcript of the current/last call, captured turn-by-turn from the
   // realtime session and mirrored to storage. Replayed into a fresh session on
   // reconnect/resume so the model picks the conversation back up.
@@ -440,11 +440,12 @@ export default function App() {
       },
     );
 
-    if (voiceSession.transport !== "webrtc") {
-      throw new Error(`Gateway returned unsupported transport: ${voiceSession.transport}`);
+    const returnedTransport = (voiceSession as { transport?: unknown }).transport;
+    if (returnedTransport !== "webrtc" && returnedTransport !== "provider-websocket") {
+      throw new Error(`Gateway returned unsupported transport: ${String(returnedTransport)}`);
     }
 
-    const call = new OpenAIRealtimeCall(
+    const call = new BrowserRealtimeCall(
       gateway,
       sessionKey,
       agentId,
@@ -478,7 +479,7 @@ export default function App() {
     );
     callRef.current = call;
     await call.start();
-    log("WebRTC call started");
+    log(`${voiceSession.provider} realtime call started (${voiceSession.transport})`);
   }
 
   // Records a spoken turn (user or assistant — the transcript the model itself

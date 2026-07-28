@@ -25,22 +25,39 @@ export type GatewayResponse = {
   };
 };
 
-export type RealtimeBrowserSession = {
+type RealtimeBrowserSessionBase = {
   provider: string;
-  transport: "webrtc";
-  clientSecret: string;
-  offerUrl?: string;
-  offerHeaders?: Record<string, string>;
-  /**
-   * ICE servers (STUN/TURN) supplied by the Gateway. When present these take
-   * precedence over the client's built-in public STUN defaults, letting the
-   * server hand out TURN relay credentials for restrictive networks.
-   */
-  iceServers?: RTCIceServer[];
   model?: string;
   voice?: string;
   expiresAt?: number;
 };
+
+export type RealtimeBrowserSession =
+  | (RealtimeBrowserSessionBase & {
+      transport: "webrtc";
+      clientSecret: string;
+      offerUrl?: string;
+      offerHeaders?: Record<string, string>;
+      /**
+       * ICE servers (STUN/TURN) supplied by the Gateway. When present these take
+       * precedence over the client's built-in public STUN defaults, letting the
+       * server hand out TURN relay credentials for restrictive networks.
+       */
+      iceServers?: RTCIceServer[];
+    })
+  | (RealtimeBrowserSessionBase & {
+      transport: "provider-websocket";
+      protocol: string;
+      clientSecret: string;
+      websocketUrl: string;
+      audio: {
+        inputEncoding: "pcm16" | "g711_ulaw";
+        inputSampleRateHz: number;
+        outputEncoding: "pcm16" | "g711_ulaw";
+        outputSampleRateHz: number;
+      };
+      initialMessage?: unknown;
+    });
 
 export type TranscriptEntry = {
   id: string;

@@ -101,11 +101,21 @@ type ToolBuffer = {
   args: string;
 };
 
-export class OpenAIRealtimeCall {
+export class BrowserRealtimeCall {
   private peer: RTCPeerConnection | null = null;
   private channel: RTCDataChannel | null = null;
+  private websocket: WebSocket | null = null;
   private media: MediaStream | null = null;
   private audio: HTMLAudioElement | null = null;
+  private inputContext: AudioContext | null = null;
+  private outputContext: AudioContext | null = null;
+  private inputSource: MediaStreamAudioSourceNode | null = null;
+  private inputProcessor: ScriptProcessorNode | null = null;
+  private inputSink: GainNode | null = null;
+  private outputDestination: MediaStreamAudioDestinationNode | null = null;
+  private outputSources = new Set<AudioBufferSourceNode>();
+  private outputPlayhead = 0;
+  private outputSampleRate = 24000;
   private closed = false;
   private responseActive = false;
   private responseCreateInFlight = false;
@@ -135,6 +145,7 @@ export class OpenAIRealtimeCall {
   // that turn would be lost. Holding the running text lets us flush it on
   // connection loss so the last bit of the conversation survives the reconnect.
   private pendingAssistantTranscript = "";
+  private pendingUserTranscript = "";
 
   constructor(
     private readonly gateway: GatewayClient,
@@ -149,14 +160,20 @@ export class OpenAIRealtimeCall {
   ) {}
 
   async start() {
+    if (this.session.transport === "provider-websocket") {
+      await this.startProviderWebSocket(this.session);
+      return;
+    }
+    await this.startWebRtc(this.session);
+  }
+
+  private async startWebRtc(session: Extract<RealtimeBrowserSession, { transport: "webrtc" }>) {
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
       throw new Error("This browser does not support microphone WebRTC calls");
     }
 
     this.closed = false;
-    const iceServers = this.session.iceServers?.length
-      ? this.session.iceServers
-      : DEFAULT_ICE_SERVERS;
+    const iceServers = session.iceServers?.length ? session.iceServers : DEFAULT_ICE_SERVERS;
     this.callbacks.onLog(
       `WebRTC ICE servers: ${iceServers.map((server) => JSON.stringify(server.urls)).join(", ")}`,
     );
@@ -201,14 +218,14 @@ export class OpenAIRealtimeCall {
     await this.peer.setLocalDescription(offer);
     if (this.closed) return;
 
-    const offerUrl = this.session.offerUrl || "https://api.openai.com/v1/realtime/calls";
+    const offerUrl = session.offerUrl || "https://api.openai.com/v1/realtime/calls";
     this.callbacks.onLog(`Posting WebRTC offer to ${offerUrl}`);
     const response = await fetch(offerUrl, {
       method: "POST",
       body: offer.sdp || "",
       headers: {
-        Authorization: `Bearer ${this.session.clientSecret}`,
-        ...this.session.offerHeaders,
+        Authorization: `Bearer ${session.clientSecret}`,
+        ...session.offerHeaders,
         "Content-Type": "application/sdp",
       },
     });
@@ -224,6 +241,98 @@ export class OpenAIRealtimeCall {
     await this.peer.setRemoteDescription({ type: "answer", sdp: responseText });
     if (this.closed) return;
     // oxlint-enable react-doctor/async-defer-await
+  }
+
+  private async startProviderWebSocket(
+    session: Extract<RealtimeBrowserSession, { transport: "provider-websocket" }>,
+  ) {
+    if (!navigator.mediaDevices?.getUserMedia || typeof WebSocket === "undefined") {
+      throw new Error("This browser does not support microphone WebSocket calls");
+    }
+    if (session.protocol !== "xai-realtime") {
+      throw new Error(`Unsupported realtime WebSocket protocol: ${session.protocol}`);
+    }
+    if (session.audio.inputEncoding !== "pcm16" || session.audio.outputEncoding !== "pcm16") {
+      throw new Error("xAI browser realtime currently requires PCM16 input and output audio");
+    }
+
+    const websocketUrl = validateXaiWebSocketUrl(session.websocketUrl);
+    this.closed = false;
+    const media = await navigator.mediaDevices.getUserMedia({
+      audio: { autoGainControl: true, echoCancellation: true, noiseSuppression: true },
+    });
+    if (this.closed) {
+      media.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    this.media = media;
+    this.callbacks.onStream?.("mic", media);
+
+    const AudioCtx = resolveAudioContextConstructor();
+    if (!AudioCtx) throw new Error("This browser does not support realtime PCM audio");
+    this.inputContext = new AudioCtx({ sampleRate: session.audio.inputSampleRateHz });
+    this.outputContext = new AudioCtx({ sampleRate: session.audio.outputSampleRateHz });
+    this.outputSampleRate = session.audio.outputSampleRateHz;
+    // `closed` can flip while either context resumes (the user hangs up during
+    // setup), so the post-await guard is required to avoid opening a socket.
+    // oxlint-disable react-doctor/async-defer-await
+    await Promise.all([this.inputContext.resume(), this.outputContext.resume()]);
+    if (this.closed) return;
+    // oxlint-enable react-doctor/async-defer-await
+
+    this.outputDestination = this.outputContext.createMediaStreamDestination();
+    this.callbacks.onStream?.("remote", this.outputDestination.stream);
+
+    const websocket = new WebSocket(websocketUrl, [`xai-client-secret.${session.clientSecret}`]);
+    this.websocket = websocket;
+    websocket.addEventListener("open", () => {
+      if (this.closed || this.websocket !== websocket) return;
+      if (session.initialMessage) this.send(session.initialMessage);
+      this.replayConversation();
+      this.startPcmMicrophonePump(session.audio.inputSampleRateHz);
+      this.callbacks.onStatus("listening");
+      this.callbacks.onLog("xAI realtime WebSocket is open");
+    });
+    websocket.addEventListener("message", (event) => this.handleRealtimeEvent(event.data));
+    websocket.addEventListener("close", (event) => {
+      if (this.closed || this.websocket !== websocket) return;
+      const detail = event.reason ? `: ${event.reason}` : "";
+      this.callbacks.onLog(`xAI realtime WebSocket closed (${event.code})${detail}`);
+      this.reportConnectionLost("closed");
+    });
+    websocket.addEventListener("error", () => {
+      if (this.closed || this.websocket !== websocket) return;
+      this.callbacks.onLog("xAI realtime WebSocket connection failed");
+    });
+  }
+
+  private startPcmMicrophonePump(expectedSampleRate: number) {
+    if (!this.media || !this.inputContext) return;
+    if (this.inputContext.sampleRate !== expectedSampleRate) {
+      this.callbacks.onLog(
+        `Browser audio input is ${this.inputContext.sampleRate} Hz; xAI requested ${expectedSampleRate} Hz`,
+      );
+    }
+    this.inputSource = this.inputContext.createMediaStreamSource(this.media);
+    this.inputProcessor = this.inputContext.createScriptProcessor(4096, 1, 1);
+    this.inputSink = this.inputContext.createGain();
+    this.inputSink.gain.value = 0;
+    this.inputProcessor.onaudioprocess = (event) => {
+      if (
+        this.closed ||
+        this.turnDetectionSuspended ||
+        this.websocket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      const input = event.inputBuffer.getChannelData(0);
+      const samples = resampleAudio(input, this.inputContext!.sampleRate, expectedSampleRate);
+      const pcm = float32ToPcm16(samples);
+      this.send({ type: "input_audio_buffer.append", audio: bytesToBase64(pcm) });
+    };
+    this.inputSource.connect(this.inputProcessor);
+    this.inputProcessor.connect(this.inputSink);
+    this.inputSink.connect(this.inputContext.destination);
   }
 
   // Seed the fresh session with the prior conversation so the model resumes
@@ -307,7 +416,8 @@ export class OpenAIRealtimeCall {
     // snapshots the transcript to replay it into the reconnected session, so the
     // flush has to land first or the last spoken bit is dropped from the resume.
     this.flushPendingTranscript();
-    this.callbacks.onStatus("error", `WebRTC ${state}`);
+    const transport = this.session.transport === "webrtc" ? "WebRTC" : "xAI WebSocket";
+    this.callbacks.onStatus("error", `${transport} ${state}`);
     this.callbacks.onConnectionLost(state);
   }
 
@@ -328,12 +438,27 @@ export class OpenAIRealtimeCall {
     this.clearRecoveryTimer();
     this.channel?.close();
     this.channel = null;
+    this.websocket?.close();
+    this.websocket = null;
     this.peer?.close();
     this.peer = null;
     this.media?.getTracks().forEach((track) => track.stop());
     this.media = null;
     this.audio?.remove();
     this.audio = null;
+    this.inputProcessor?.disconnect();
+    this.inputProcessor = null;
+    this.inputSource?.disconnect();
+    this.inputSource = null;
+    this.inputSink?.disconnect();
+    this.inputSink = null;
+    this.stopPcmOutput();
+    this.outputDestination?.disconnect();
+    this.outputDestination = null;
+    void this.inputContext?.close();
+    this.inputContext = null;
+    void this.outputContext?.close();
+    this.outputContext = null;
     this.abortControllers.forEach((controller) => controller.abort());
     this.abortControllers.clear();
     this.toolBuffers.clear();
@@ -342,6 +467,7 @@ export class OpenAIRealtimeCall {
     this.responseCreatePending = false;
     this.toolCallsInFlight = 0;
     this.turnDetectionSuspended = false;
+    this.pendingUserTranscript = "";
   }
 
   // Dev-only test hook: force the fatal connection-lost path so reconnect +
@@ -370,16 +496,55 @@ export class OpenAIRealtimeCall {
     return tracks.length > 0 && tracks.every((track) => !track.enabled);
   }
 
+  private playPcm16(base64: string) {
+    if (!this.outputContext || !base64) return;
+    const pcm = base64ToPcm16(base64);
+    if (pcm.length === 0) return;
+    const buffer = this.outputContext.createBuffer(1, pcm.length, this.outputSampleRate);
+    const samples = buffer.getChannelData(0);
+    for (let index = 0; index < pcm.length; index += 1) {
+      samples[index] = pcm[index]! / 32768;
+    }
+    const source = this.outputContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.outputContext.destination);
+    if (this.outputDestination) source.connect(this.outputDestination);
+    source.addEventListener("ended", () => {
+      this.outputSources.delete(source);
+      if (this.outputSources.size === 0) this.callbacks.onSpeaking?.(false);
+    });
+    const startsAt = Math.max(this.outputContext.currentTime, this.outputPlayhead);
+    this.outputPlayhead = startsAt + buffer.duration;
+    this.outputSources.add(source);
+    if (this.outputSources.size === 1) this.callbacks.onSpeaking?.(true);
+    source.start(startsAt);
+  }
+
+  private stopPcmOutput() {
+    for (const source of this.outputSources) {
+      try {
+        source.stop();
+      } catch {
+        // It may already have ended between iteration and stop().
+      }
+    }
+    this.outputSources.clear();
+    this.outputPlayhead = this.outputContext?.currentTime ?? 0;
+    this.callbacks.onSpeaking?.(false);
+  }
+
   private send(event: unknown) {
     const type = (event as { type?: string } | null)?.type ?? "unknown";
     if (this.channel?.readyState === "open") {
       console.debug(`${LOG_PREFIX} → send ${type}`, event);
       this.channel.send(JSON.stringify(event));
+    } else if (this.websocket?.readyState === WebSocket.OPEN) {
+      if (type !== "input_audio_buffer.append") {
+        console.debug(`${LOG_PREFIX} → send ${type}`, event);
+      }
+      this.websocket.send(JSON.stringify(event));
     } else {
-      console.warn(
-        `${LOG_PREFIX} → send DROPPED ${type} (data channel: ${this.channel?.readyState ?? "none"})`,
-        event,
-      );
+      console.warn(`${LOG_PREFIX} → send DROPPED ${type} (realtime transport not open)`, event);
     }
   }
 
@@ -404,8 +569,15 @@ export class OpenAIRealtimeCall {
       case "session.updated":
         this.captureTurnDetectionConfig(event);
         return;
+      case "conversation.item.input_audio_transcription.updated":
+        // xAI emits cumulative (correctable) updates instead of OpenAI's
+        // incremental transcription deltas. Keep only the latest value and
+        // commit it when the normal completed event arrives.
+        this.pendingUserTranscript = stringField(event, "transcript") || "";
+        return;
       case "conversation.item.input_audio_transcription.completed":
-        this.pushTranscript("user", stringField(event, "transcript"));
+        this.pushTranscript("user", stringField(event, "transcript") || this.pendingUserTranscript);
+        this.pendingUserTranscript = "";
         return;
       // Beta and GA names for the same assistant-transcript stream: the beta
       // API emits `response.audio_transcript.*`, the GA API (session type
@@ -413,17 +585,28 @@ export class OpenAIRealtimeCall {
       // Handle both so assistant speech is captured regardless of API surface.
       case "response.audio_transcript.delta":
       case "response.output_audio_transcript.delta":
+      case "response.output_text.delta":
         // Accumulate the running assistant transcript so an abrupt drop before
         // `.done` can still flush the in-progress turn (see reportConnectionLost).
         this.pendingAssistantTranscript += stringField(event, "delta") || "";
         return;
       case "response.audio_transcript.done":
       case "response.output_audio_transcript.done":
+      case "response.output_text.done":
         // The `.done` payload is the authoritative full transcript; commit it and
         // drop the running accumulation so it can't be double-flushed on loss.
         this.pendingAssistantTranscript = "";
-        this.pushTranscript("assistant", stringField(event, "transcript"));
+        this.pushTranscript(
+          "assistant",
+          stringField(event, "transcript") || stringField(event, "text"),
+        );
         return;
+      case "response.audio.delta":
+      case "response.output_audio.delta": {
+        const audio = stringField(event, "delta") || stringField(event, "audio");
+        if (audio) this.playPcm16(audio);
+        return;
+      }
       case "response.function_call_arguments.delta":
         this.bufferToolDelta(event);
         return;
@@ -431,6 +614,7 @@ export class OpenAIRealtimeCall {
         void this.handleToolCall(event);
         return;
       case "input_audio_buffer.speech_started":
+        if (this.session.transport === "provider-websocket") this.stopPcmOutput();
         this.callbacks.onStatus("listening", "Speech detected");
         return;
       case "input_audio_buffer.speech_stopped":
@@ -455,6 +639,8 @@ export class OpenAIRealtimeCall {
         this.callbacks.onStatus("thinking", "Generating response");
         return;
       case "response.cancelled":
+        if (this.session.transport === "provider-websocket") this.stopPcmOutput();
+      // Fall through: cancelled and done share the same lifecycle cleanup.
       case "response.done":
         this.responseActive = false;
         this.responseCreateInFlight = false;
@@ -568,7 +754,13 @@ export class OpenAIRealtimeCall {
     } finally {
       this.abortControllers.delete(controller);
       this.toolCallsInFlight -= 1;
-      if (this.toolCallsInFlight === 0) this.consultDetail = "";
+      if (this.toolCallsInFlight === 0) {
+        this.consultDetail = "";
+        // xAI can emit several function calls for one turn and requires every
+        // output before response.create. Waiting for the shared in-flight count
+        // also avoids racing parallel tool calls on OpenAI.
+        this.requestResponseCreate();
+      }
       if (isAgentConsult) {
         this.agentConsultsInFlight -= 1;
         if (this.agentConsultsInFlight === 0) this.callbacks.onConsulting?.(false);
@@ -579,6 +771,15 @@ export class OpenAIRealtimeCall {
   private suspendTurnDetection() {
     if (this.turnDetectionSuspended) return;
     this.turnDetectionSuspended = true;
+    if (this.session.transport === "provider-websocket") {
+      // xAI's Voice Agent session shape keeps turn_detection at the session
+      // root. Temporarily disabling it prevents stray mic audio from creating a
+      // new turn while an OpenClaw tool call is still in flight.
+      this.send({ type: "session.update", session: { turn_detection: null } });
+      this.send({ type: "input_audio_buffer.clear" });
+      this.callbacks.onLog("Suspended auto turn-taking for OpenClaw tool call");
+      return;
+    }
     // Disable automatic responses/interruption (explicit response.create still
     // works) while preserving the session's actual VAD shape, and drop any
     // buffered partial speech so it cannot fire the moment we resume.
@@ -626,6 +827,20 @@ export class OpenAIRealtimeCall {
       this.turnDetectionConfig === undefined
         ? { type: "server_vad", create_response: true, interrupt_response: true }
         : this.turnDetectionConfig;
+    if (this.session.transport === "provider-websocket") {
+      this.send({ type: "input_audio_buffer.clear" });
+      this.send({
+        type: "session.update",
+        session: {
+          turn_detection:
+            turnDetection && typeof turnDetection === "object"
+              ? stripOpenAiTurnDetectionFlags(turnDetection)
+              : turnDetection,
+        },
+      });
+      this.callbacks.onLog("Resumed auto turn-taking");
+      return;
+    }
     this.send({
       type: "session.update",
       session: {
@@ -687,10 +902,10 @@ export class OpenAIRealtimeCall {
     return new Promise((resolve, reject) => {
       const timeout = window.setTimeout(() => {
         console.warn(
-          `${LOG_PREFIX} consult TIMEOUT after 120s (runId=${runId}) — no chat 'final' event arrived`,
+          `${LOG_PREFIX} consult TIMEOUT after 300s (runId=${runId}) — no chat 'final' event arrived`,
         );
         cleanup(() => reject(new Error("OpenClaw consult timed out")));
-      }, 120000);
+      }, 300000);
       const abort = () =>
         cleanup(() => reject(new DOMException("OpenClaw consult aborted", "AbortError")));
       const unsubscribe = this.gateway.addEventListener((event: GatewayEvent) => {
@@ -773,7 +988,6 @@ export class OpenAIRealtimeCall {
         output: JSON.stringify(result),
       },
     });
-    this.requestResponseCreate();
   }
 
   private requestResponseCreate() {
@@ -838,6 +1052,82 @@ function extractTurnDetectionConfig(session: unknown): TurnDetectionConfig | nul
     return sessionRecord.turn_detection === null ? null : recordValue(sessionRecord.turn_detection);
   }
   return undefined;
+}
+
+function stripOpenAiTurnDetectionFlags(config: TurnDetectionConfig): TurnDetectionConfig {
+  const {
+    create_response: _createResponse,
+    interrupt_response: _interruptResponse,
+    ...rest
+  } = config;
+  return rest;
+}
+
+function resolveAudioContextConstructor(): typeof AudioContext | undefined {
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  );
+}
+
+function validateXaiWebSocketUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "wss:") throw new Error("xAI realtime WebSocket URL must use wss://");
+  if (url.username || url.password) {
+    throw new Error("xAI realtime WebSocket URL must not include credentials");
+  }
+  return url.toString();
+}
+
+function resampleAudio(
+  input: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number,
+): Float32Array {
+  if (inputSampleRate === outputSampleRate) return input;
+  const outputLength = Math.max(1, Math.round(input.length * (outputSampleRate / inputSampleRate)));
+  const output = new Float32Array(outputLength);
+  const scale = input.length / outputLength;
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * scale;
+    const left = Math.floor(position);
+    const right = Math.min(input.length - 1, left + 1);
+    const fraction = position - left;
+    output[index] = (input[left] ?? 0) * (1 - fraction) + (input[right] ?? 0) * fraction;
+  }
+  return output;
+}
+
+function float32ToPcm16(samples: Float32Array): Uint8Array {
+  const bytes = new Uint8Array(samples.length * 2);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index] ?? 0));
+    view.setInt16(index * 2, sample < 0 ? sample * 32768 : sample * 32767, true);
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 32768;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToPcm16(value: string): Int16Array {
+  const binary = atob(value);
+  const length = Math.floor(binary.length / 2);
+  const samples = new Int16Array(length);
+  for (let index = 0; index < length; index += 1) {
+    const low = binary.charCodeAt(index * 2);
+    const high = binary.charCodeAt(index * 2 + 1);
+    const unsigned = low | (high << 8);
+    samples[index] = unsigned >= 0x8000 ? unsigned - 0x10000 : unsigned;
+  }
+  return samples;
 }
 
 function safeJson(raw: string) {

@@ -34,14 +34,16 @@ From the repo root, `npm run build:app` builds this and stages it into `../webap
 ## How a call works
 
 1. Connect to the gateway WebSocket (same origin).
-2. `browserVoice.create` mints an OpenAI Realtime WebRTC session from the
-   plugin's own realtime voice config (`plugins.entries.sureclaw-voice.config.realtime`).
-3. The browser runs the WebRTC call directly with the realtime provider;
+2. `browserVoice.create` mints either an OpenAI Realtime WebRTC session or an
+   xAI Grok Voice WebSocket session from the plugin's own realtime voice config
+   (`plugins.entries.sureclaw-voice.config.realtime`).
+3. The browser runs the call directly with the selected realtime provider;
    `openclaw_agent_consult` tool calls are forwarded back through the gateway
    (`talk.client.toolCall`) so the voice agent can use the full OpenClaw agent.
 
 ## WebRTC reliability (TURN)
 
-Calls use public STUN by default (fine on Wi-Fi). On mobile/5G a TURN relay is
-recommended — configure it under the plugin's `webrtc` config (see root README);
-the plugin mints short-lived credentials per session.
+OpenAI calls use public STUN by default (fine on Wi-Fi). On mobile/5G a TURN
+relay is recommended — configure it under the plugin's `webrtc` config (see
+root README); the plugin mints short-lived credentials per session. xAI calls
+use a direct TLS WebSocket and do not use STUN or TURN.
