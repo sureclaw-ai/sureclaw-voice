@@ -28,6 +28,15 @@ type BrowserVoiceParams = {
 
 type RealtimeVoiceConfig = {
   enabled?: boolean;
+  // Default voice engine. Omitted/"legacy" preserves the plugin's existing
+  // browser-owned OpenAI Realtime and xAI paths. "gpt-live" delegates the
+  // control channel, tools, and transcript lifecycle to native OpenClaw Talk
+  // and is restricted to OpenAI gpt-live-* models.
+  path?: "legacy" | "gpt-live";
+  // GPT-Live engine settings. When present, GPT-Live is offered alongside the
+  // legacy engine (provider/model/voice above) and the PWA shows a switch.
+  // Without it, `path: "gpt-live"` reads the top-level model/voice instead.
+  gptLive?: GptLiveConfig;
   provider?: string;
   providers?: Record<string, unknown>;
   model?: string;
@@ -47,6 +56,20 @@ type RealtimeVoiceConfig = {
   bootstrapContextFiles?: string[];
   agentContext?: AgentContextConfig;
   minBargeInAudioEndMs?: number;
+};
+
+type GptLiveConfig = {
+  enabled?: boolean;
+  // gpt-live-1 (OpenAI Platform key, $/min) or gpt-live-1-codex (ChatGPT
+  // OAuth). Omit to let OpenClaw choose from the credentials it has.
+  model?: string;
+  voice?: string;
+};
+
+type VoiceEngines = {
+  defaultEngine: "legacy" | "gpt-live";
+  legacy: boolean;
+  gptLive?: { model: string; voice: string };
 };
 
 // Bounded agent persona/context capsule injected into realtime voice
@@ -405,7 +428,17 @@ const entry = definePluginEntry({
         additionalProperties: true,
         required: ["model"],
         properties: {
+          path: { type: "string", enum: ["legacy", "gpt-live"] },
           model: { type: "string" },
+          gptLive: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              enabled: { type: "boolean" },
+              model: { type: "string" },
+              voice: { type: "string" },
+            },
+          },
         },
       },
     },
@@ -416,7 +449,14 @@ const entry = definePluginEntry({
     // realtime-voice provider. Register the browser-native WebSocket path here
     // so the same provider selection/config flow used by OpenAI can select xAI.
     // The browser receives only a short-lived client secret, never the API key.
-    api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
+    // Register the compatibility provider only when the legacy xAI path is
+    // selected. New OpenClaw releases bundle xAI themselves; avoiding an
+    // unconditional registration also keeps OpenAI/GPT-Live startups free of
+    // duplicate-provider warnings while retaining the old xAI implementation.
+    const configuredRealtime = api.pluginConfig?.realtime;
+    if (configuredRealtime?.provider === XAI_REALTIME_PROVIDER_ID) {
+      api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
+    }
 
     registerWebappRoute(api);
 
@@ -438,6 +478,15 @@ const entry = definePluginEntry({
             code: "UNAVAILABLE",
             message:
               "No realtime voice config found — configure plugins.entries.sureclaw-voice.config.realtime",
+          });
+          return;
+        }
+        if (isGptLiveModel(realtimeConfig.model)) {
+          // GPT-Live needs OpenClaw's gateway-owned Talk runtime; the browser
+          // starts it through talk.client.create, not this legacy minting path.
+          respond(false, undefined, {
+            code: "UNAVAILABLE",
+            message: `${realtimeConfig.model} is a GPT-Live model; use the GPT-Live engine (talk.client.create)`,
           });
           return;
         }
@@ -614,6 +663,13 @@ function registerWebappRoute(api: {
   }) => void;
 }) {
   const webapp = api.pluginConfig?.webapp;
+  const engines = resolveVoiceEngines(api.pluginConfig?.realtime);
+  if (engines.gptLive) {
+    api.logger?.info?.(
+      `sureclaw-voice: GPT-Live engine ${engines.gptLive.model || "(OpenClaw default model)"}` +
+        `${engines.gptLive.voice ? ` voice=${engines.gptLive.voice}` : ""}; default engine ${engines.defaultEngine}`,
+    );
+  }
 
   const dir = resolveWebappDir();
   if (!dir) {
@@ -649,6 +705,12 @@ function registerWebappRoute(api: {
     __APP_SHORT_NAME__: homeScreenLabel,
     __APP_GATEWAY_AUTH__: gatewayAuthMode,
     __APP_RECORD_MEMORIES__: String(recordMemories),
+    __APP_VOICE_ENGINES__: [engines.legacy ? "legacy" : "", engines.gptLive ? "gpt-live" : ""]
+      .filter(Boolean)
+      .join(","),
+    __APP_DEFAULT_ENGINE__: engines.defaultEngine,
+    __APP_GPT_LIVE_MODEL__: engines.gptLive?.model ?? "",
+    __APP_GPT_LIVE_VOICE__: engines.gptLive?.voice ?? "",
   };
 
   // Serve-only: the gateway authenticates the WebSocket itself (token or
@@ -661,6 +723,28 @@ function registerWebappRoute(api: {
     handler: (req, res) => serveWebappFile(req, res, mount, resolvePath(dir), tokens),
   });
   api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
+}
+
+// Works out which voice engines the PWA may offer. The legacy engine is the
+// plugin's own realtime provider/model; GPT-Live is either the `gptLive` block
+// or, for GPT-Live-only configs, `path: "gpt-live"` with a gpt-live-* model.
+function resolveVoiceEngines(realtime: RealtimeVoiceConfig | undefined): VoiceEngines {
+  const topLevelIsGptLive = isGptLiveModel(realtime?.model);
+  let gptLive: VoiceEngines["gptLive"];
+  if (realtime?.gptLive && realtime.gptLive.enabled !== false) {
+    gptLive = { model: realtime.gptLive.model?.trim() ?? "", voice: realtime.gptLive.voice?.trim() ?? "" };
+  } else if (realtime?.path === "gpt-live" && (topLevelIsGptLive || !realtime.model)) {
+    gptLive = { model: realtime.model?.trim() ?? "", voice: realtime.voice?.trim() ?? "" };
+  }
+  if (gptLive?.model && !isGptLiveModel(gptLive.model)) gptLive = undefined;
+  const legacy = Boolean(realtime?.provider && realtime.model && !topLevelIsGptLive);
+  const defaultEngine =
+    gptLive && (realtime?.path === "gpt-live" || !legacy) ? "gpt-live" : "legacy";
+  return { defaultEngine, legacy, ...(gptLive ? { gptLive } : {}) };
+}
+
+function isGptLiveModel(model: string | undefined) {
+  return typeof model === "string" && model.trim().startsWith("gpt-live-");
 }
 
 // Locates the bundled web app next to this module — handling both the linked

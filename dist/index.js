@@ -231,12 +231,27 @@ const entry = definePluginEntry({
 				type: "object",
 				additionalProperties: true,
 				required: ["model"],
-				properties: { model: { type: "string" } }
+				properties: {
+					path: {
+						type: "string",
+						enum: ["legacy", "gpt-live"]
+					},
+					model: { type: "string" },
+					gptLive: {
+						type: "object",
+						additionalProperties: false,
+						properties: {
+							enabled: { type: "boolean" },
+							model: { type: "string" },
+							voice: { type: "string" }
+						}
+					}
+				}
 			}
 		}
 	},
 	register(api) {
-		api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
+		if ((api.pluginConfig?.realtime)?.provider === XAI_REALTIME_PROVIDER_ID) api.registerRealtimeVoiceProvider(buildXaiRealtimeVoiceProvider());
 		registerWebappRoute(api);
 		api.registerGatewayMethod("browserVoice.create", async ({ params, respond, context }) => {
 			const typedParams = normalizeParams(params);
@@ -254,6 +269,13 @@ const entry = definePluginEntry({
 					respond(false, void 0, {
 						code: "UNAVAILABLE",
 						message: "No realtime voice config found — configure plugins.entries.sureclaw-voice.config.realtime"
+					});
+					return;
+				}
+				if (isGptLiveModel(realtimeConfig.model)) {
+					respond(false, void 0, {
+						code: "UNAVAILABLE",
+						message: `${realtimeConfig.model} is a GPT-Live model; use the GPT-Live engine (talk.client.create)`
 					});
 					return;
 				}
@@ -363,6 +385,8 @@ const WEBAPP_CONTENT_TYPES = {
 const TOKENIZED_EXTENSIONS = /* @__PURE__ */ new Set([".html", ".webmanifest"]);
 function registerWebappRoute(api) {
 	const webapp = api.pluginConfig?.webapp;
+	const engines = resolveVoiceEngines(api.pluginConfig?.realtime);
+	if (engines.gptLive) api.logger?.info?.(`sureclaw-voice: GPT-Live engine ${engines.gptLive.model || "(OpenClaw default model)"}${engines.gptLive.voice ? ` voice=${engines.gptLive.voice}` : ""}; default engine ${engines.defaultEngine}`);
 	const dir = resolveWebappDir();
 	if (!dir) {
 		api.logger?.warn?.("sureclaw-voice: voice web app not served — no built assets found. Build the PWA and stage it into the plugin's webapp/ directory (npm run build).");
@@ -379,7 +403,11 @@ function registerWebappRoute(api) {
 		__APP_FULL_NAME__: productTitle,
 		__APP_SHORT_NAME__: homeScreenLabel,
 		__APP_GATEWAY_AUTH__: gatewayAuthMode,
-		__APP_RECORD_MEMORIES__: String(recordMemories)
+		__APP_RECORD_MEMORIES__: String(recordMemories),
+		__APP_VOICE_ENGINES__: [engines.legacy ? "legacy" : "", engines.gptLive ? "gpt-live" : ""].filter(Boolean).join(","),
+		__APP_DEFAULT_ENGINE__: engines.defaultEngine,
+		__APP_GPT_LIVE_MODEL__: engines.gptLive?.model ?? "",
+		__APP_GPT_LIVE_VOICE__: engines.gptLive?.voice ?? ""
 	};
 	const mount = normalizeWebappMount(webapp?.path ?? DEFAULT_WEBAPP_MOUNT);
 	api.registerHttpRoute({
@@ -389,6 +417,28 @@ function registerWebappRoute(api) {
 		handler: (req, res) => serveWebappFile(req, res, mount, resolve(dir), tokens)
 	});
 	api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
+}
+function resolveVoiceEngines(realtime) {
+	const topLevelIsGptLive = isGptLiveModel(realtime?.model);
+	let gptLive;
+	if (realtime?.gptLive && realtime.gptLive.enabled !== false) gptLive = {
+		model: realtime.gptLive.model?.trim() ?? "",
+		voice: realtime.gptLive.voice?.trim() ?? ""
+	};
+	else if (realtime?.path === "gpt-live" && (topLevelIsGptLive || !realtime.model)) gptLive = {
+		model: realtime.model?.trim() ?? "",
+		voice: realtime.voice?.trim() ?? ""
+	};
+	if (gptLive?.model && !isGptLiveModel(gptLive.model)) gptLive = void 0;
+	const legacy = Boolean(realtime?.provider && realtime.model && !topLevelIsGptLive);
+	return {
+		defaultEngine: gptLive && (realtime?.path === "gpt-live" || !legacy) ? "gpt-live" : "legacy",
+		legacy,
+		...gptLive ? { gptLive } : {}
+	};
+}
+function isGptLiveModel(model) {
+	return typeof model === "string" && model.trim().startsWith("gpt-live-");
 }
 function resolveWebappDir() {
 	for (const rel of ["./webapp/", "../webapp/"]) {

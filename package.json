@@ -1,6 +1,6 @@
 {
   "name": "sureclaw-voice",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "description": "SureClaw Voice — OpenClaw plugin that serves the browser voice PWA and mints OpenAI or xAI browser realtime sessions.",
   "license": "UNLICENSED",
@@ -27,7 +27,7 @@
     "build:plugin": "rolldown --config rolldown.config.ts"
   },
   "devDependencies": {
-    "openclaw": "^2026.6.8",
+    "openclaw": "^2026.10.6",
     "rolldown": "^1.1.2",
     "typescript": "^6.0.3"
   }

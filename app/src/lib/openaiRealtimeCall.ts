@@ -1021,7 +1021,7 @@ export class BrowserRealtimeCall {
 // Turn a raw agent tool id ("read_file", "webSearch", "bash") into something
 // speakable for the status line ("read file", "web search", "bash"). Splits
 // snake/kebab/camelCase and lowercases; falls back to a neutral word if empty.
-function humanizeToolName(name: string): string {
+export function humanizeToolName(name: string): string {
   const spaced = name
     .replace(/[_-]+/g, " ")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")

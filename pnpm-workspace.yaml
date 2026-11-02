@@ -3,6 +3,7 @@ packages:
 allowBuilds:
   '@google/genai': false
   esbuild: true
+  koffi: false
   openclaw: true
   protobufjs: true
   sharp: true

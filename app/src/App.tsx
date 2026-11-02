@@ -4,12 +4,14 @@ import type {
   CallStatus,
   GatewayEvent,
   GatewaySettings,
+  GptLiveBrowserSession,
   RealtimeBrowserSession,
   ReplayTurn,
   TranscriptEntry,
 } from "./types";
 import { GatewayClient } from "./lib/gatewayClient";
 import { BrowserRealtimeCall } from "./lib/openaiRealtimeCall";
+import { OpenClawGptLiveCall } from "./lib/openclawGptLiveCall";
 import {
   clearConversation,
   hasResumableConversation,
@@ -93,6 +95,75 @@ function readRecordMemories(): boolean {
 }
 
 const RECORD_MEMORIES = readRecordMemories();
+
+type VoiceEngine = "legacy" | "gpt-live";
+
+type VoiceEngineConfig = {
+  available: VoiceEngine[];
+  defaultEngine: VoiceEngine;
+  gptLiveModel?: string;
+  gptLiveVoice?: string;
+};
+
+// Reads the engines the plugin offers from the meta tags it rewrites at serve
+// time. The raw Vite dev server leaves the placeholders, which fall back to the
+// legacy engine only.
+function readVoiceEngineConfig(): VoiceEngineConfig {
+  const readMeta = (name: string) => {
+    const value = document.querySelector(`meta[name="${name}"]`)?.getAttribute("content")?.trim();
+    return value && !/^__.*__$/.test(value) ? value : "";
+  };
+  const available = readMeta("x-app-voice-engines")
+    .split(",")
+    .filter((engine): engine is VoiceEngine => engine === "legacy" || engine === "gpt-live");
+  if (available.length === 0) available.push("legacy");
+  const configuredDefault = readMeta("x-app-default-engine");
+  return {
+    available,
+    defaultEngine: available.includes(configuredDefault as VoiceEngine)
+      ? (configuredDefault as VoiceEngine)
+      : available[0],
+    gptLiveModel: readMeta("x-app-gpt-live-model") || undefined,
+    gptLiveVoice: readMeta("x-app-gpt-live-voice") || undefined,
+  };
+}
+
+const VOICE_ENGINES = readVoiceEngineConfig();
+const ENGINE_STORAGE_KEY = "sureclaw-voice-engine";
+
+// The caller's last engine choice, when the deployment still offers it.
+function loadEnginePreference(): VoiceEngine {
+  try {
+    const stored = localStorage.getItem(ENGINE_STORAGE_KEY);
+    if (stored && VOICE_ENGINES.available.includes(stored as VoiceEngine)) {
+      return stored as VoiceEngine;
+    }
+  } catch {
+    // Storage blocked (private mode); use the configured default.
+  }
+  return VOICE_ENGINES.defaultEngine;
+}
+
+const ENGINE_LABELS: Record<VoiceEngine, string> = { legacy: "Realtime", "gpt-live": "GPT-Live" };
+
+type ActiveVoiceCall = {
+  start: () => Promise<void>;
+  stop: () => void;
+  setMicMuted: (muted: boolean) => void;
+  isMicMuted: () => boolean;
+  simulateDropout: () => void;
+  closeLogicalSession?: () => Promise<void>;
+};
+
+type ActiveVoiceCallbacks = {
+  onStatus: (status: CallStatus, detail?: string) => void;
+  onTranscript: (entry: TranscriptEntry) => void;
+  onLog: (line: string) => void;
+  onStream: (kind: "mic" | "remote", stream: MediaStream) => void;
+  onSpeaking: (speaking: boolean) => void;
+  onConsulting: (active: boolean) => void;
+  onConnectionLost: (state: string) => void;
+};
 
 // Same-origin Gateway endpoint. When the app is served by the OpenClaw gateway
 // itself (e.g. https://host/voice behind cloudflared), the WebSocket goes back
@@ -286,7 +357,15 @@ export default function App() {
   // captured / cleared. Drives the idle Resume-vs-Start-new choice.
   const [resumeAvailable, setResumeAvailable] = useState(() => hasResumableConversation());
   const gatewayRef = useRef<GatewayClient | null>(null);
-  const callRef = useRef<BrowserRealtimeCall | null>(null);
+  const callRef = useRef<ActiveVoiceCall | null>(null);
+  // Native Talk reuses this logical id only while replacing a dropped WebRTC
+  // transport. A user-started call resets it; reconnect deliberately retains it.
+  const voiceSessionIdRef = useRef<string | null>(null);
+  // The engine picked on the idle screen, and the one the current call (and its
+  // reconnects) actually runs on — fixed when the call starts.
+  const [engine, setEngine] = useState<VoiceEngine>(loadEnginePreference);
+  const callEngineRef = useRef<VoiceEngine>(engine);
+  const isGptLiveCall = () => callEngineRef.current === "gpt-live";
   // The live transcript of the current/last call, captured turn-by-turn from the
   // realtime session and mirrored to storage. Replayed into a fresh session on
   // reconnect/resume so the model picks the conversation back up.
@@ -347,6 +426,8 @@ export default function App() {
     saveSettings();
     setShowSettings(false);
     reconnectAttemptsRef.current = 0;
+    voiceSessionIdRef.current = null;
+    callEngineRef.current = engine;
     // A new call gets a fresh transcript-message header; a stale debounce from
     // the previous call must not fire into this one. (Reconnects go through
     // establishCall directly and deliberately keep both.)
@@ -381,6 +462,10 @@ export default function App() {
       await establishCall({ replayTurns: [...transcriptRef.current], sessionKeyOverride });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      wantCallRef.current = false;
+      const failedCall = callRef.current;
+      failedCall?.stop();
+      await failedCall?.closeLogicalSession?.();
       teardownCall();
       raiseFatalError("Couldn't start the call", message);
     }
@@ -390,32 +475,57 @@ export default function App() {
   // realtime session with `replayTurns` so a resume/reconnect continues the
   // conversation. `sessionKeyOverride` pins the session key (used by resume and
   // reconnect); otherwise it auto-resolves from settings/agents.list.
-  async function establishCall(opts: { replayTurns: ReplayTurn[]; sessionKeyOverride?: string }) {
-    teardownCall();
+  async function establishCall(opts: {
+    replayTurns: ReplayTurn[];
+    sessionKeyOverride?: string;
+    reconnect?: boolean;
+  }) {
+    const reuseGateway = Boolean(
+      isGptLiveCall() && opts.reconnect && gatewayRef.current?.connected,
+    );
+    if (reuseGateway) {
+      callRef.current?.stop();
+      callRef.current = null;
+      setStreams([]);
+      setMuted(false);
+    } else {
+      teardownCall();
+      // A dead Gateway connection closes its owned native Talk session. Start
+      // another logical voice session; the backing agent session still carries
+      // the transcript/context accumulated before the socket loss.
+      if (isGptLiveCall() && opts.reconnect) voiceSessionIdRef.current = null;
+    }
     setStatus("connecting");
     setDetail("Opening gateway");
-    log("Connecting to Gateway");
-
-    const gateway = new GatewayClient(
-      settings.gatewayUrl.trim(),
-      settings.authMode,
-      settings.secret.trim(),
-    );
-    gatewayRef.current = gateway;
-    gateway.addEventListener((event) => logGatewayEvent(event));
-    await gateway.connect();
-    log("Gateway connected");
+    let gateway = gatewayRef.current;
+    if (!reuseGateway || !gateway) {
+      log("Connecting to Gateway");
+      gateway = new GatewayClient(
+        settings.gatewayUrl.trim(),
+        settings.authMode,
+        settings.secret.trim(),
+        !PROXY_AUTHED,
+      );
+      gatewayRef.current = gateway;
+      gateway.addEventListener((event) => logGatewayEvent(event));
+      await gateway.connect();
+      log("Gateway connected");
+    } else {
+      log("Reusing Gateway connection for GPT-Live transport replacement");
+    }
 
     // Subscribe to session events so the gateway streams this session's tool
     // activity to us as `session.tool` events during an agent consult. The
     // `tool-events` connect cap alone only delivers tool frames to runs we are
     // registered as a recipient of, which the browser Talk consult path is not —
     // so without this the consult status can't show what the agent is running.
-    try {
-      await gateway.request("sessions.subscribe", {});
-      log("Subscribed to session events");
-    } catch (error) {
-      log(`Session-event subscribe failed (tool activity may be hidden): ${String(error)}`);
+    if (!reuseGateway) {
+      try {
+        await gateway.request("sessions.subscribe", {});
+        log("Subscribed to session events");
+      } catch (error) {
+        log(`Session-event subscribe failed (tool activity may be hidden): ${String(error)}`);
+      }
     }
 
     const sessionKey = await resolveSessionKey(gateway, opts.sessionKeyOverride ?? "");
@@ -428,58 +538,83 @@ export default function App() {
     sessionKeyRef.current = sessionKey;
 
     setDetail("Setting up voice");
-    const voiceSession = await createVoiceSessionWithRetry(
-      gateway,
-      {
-        sessionKey,
-        agentId,
-      },
-      (attempt) => {
-        setDetail(`Retrying setup (${attempt}/3)`);
-        log(`Retrying voice session setup (${attempt}/3)`);
-      },
-    );
-
-    const returnedTransport = (voiceSession as { transport?: unknown }).transport;
-    if (returnedTransport !== "webrtc" && returnedTransport !== "provider-websocket") {
-      throw new Error(`Gateway returned unsupported transport: ${String(returnedTransport)}`);
+    const onSetupRetry = (attempt: number) => {
+      setDetail(`Retrying setup (${attempt}/3)`);
+      log(`Retrying voice session setup (${attempt}/3)`);
+    };
+    // The legacy engine mints its provider session up front; GPT-Live mints
+    // inside start(), after the microphone is granted, because its offer token
+    // is single-use and expires after 60 seconds.
+    const legacySession = isGptLiveCall()
+      ? undefined
+      : await createVoiceSessionWithRetry(gateway, { sessionKey, agentId }, onSetupRetry);
+    if (legacySession) {
+      const returnedTransport = (legacySession as { transport?: unknown }).transport;
+      if (returnedTransport !== "webrtc" && returnedTransport !== "provider-websocket") {
+        throw new Error(`Gateway returned unsupported transport: ${String(returnedTransport)}`);
+      }
     }
 
+    const callbacks: ActiveVoiceCallbacks = {
+      onStatus: (next, nextDetail = "") => {
+        // Reaching "listening" means the (re)connection is stable, so the
+        // reconnect budget is reset for the next independent drop.
+        if (next === "listening") reconnectAttemptsRef.current = 0;
+        setStatus(next);
+        setDetail(nextDetail);
+      },
+      onTranscript: (entry: TranscriptEntry) => {
+        console.debug(`[transcript] ${entry.role}: ${entry.text}`);
+        captureTurn(entry);
+      },
+      onLog: log,
+      onStream: addStream,
+      onSpeaking: setSpeaking,
+      onConsulting: setConsulting,
+      // The realtime session is gone, but we hold the transcript — so a drop
+      // is recoverable: reconnect and replay rather than dumping the user on
+      // an error screen. attemptReconnect falls back to the error screen once
+      // retries are exhausted or there is nothing captured to resume.
+      onConnectionLost: (state) => {
+        if (!wantCallRef.current) return; // already torn down by a deliberate hang-up
+        void attemptReconnect(state);
+      },
+    };
+    if (!legacySession) {
+      const gptLiveGateway = gateway;
+      const call = new OpenClawGptLiveCall(
+        gateway,
+        settings.gatewayUrl.trim(),
+        sessionKey,
+        async () => {
+          const session = await createGptLiveSessionWithRetry(
+            gptLiveGateway,
+            sessionKey,
+            voiceSessionIdRef.current ?? undefined,
+            onSetupRetry,
+          );
+          voiceSessionIdRef.current = session.voiceSessionId;
+          return session;
+        },
+        callbacks,
+        VOICE_ENGINES.gptLiveVoice,
+      );
+      callRef.current = call;
+      await call.start();
+      log(`GPT-Live call started (${call.session?.model ?? "unknown model"})`);
+      return;
+    }
     const call = new BrowserRealtimeCall(
       gateway,
       sessionKey,
       agentId,
-      voiceSession,
-      {
-        onStatus: (next, nextDetail = "") => {
-          // Reaching "listening" means the (re)connection is stable, so the
-          // reconnect budget is reset for the next independent drop.
-          if (next === "listening") reconnectAttemptsRef.current = 0;
-          setStatus(next);
-          setDetail(nextDetail);
-        },
-        onTranscript: (entry: TranscriptEntry) => {
-          console.debug(`[transcript] ${entry.role}: ${entry.text}`);
-          captureTurn(entry);
-        },
-        onLog: log,
-        onStream: addStream,
-        onSpeaking: setSpeaking,
-        onConsulting: setConsulting,
-        // The realtime session is gone, but we hold the transcript — so a drop
-        // is recoverable: reconnect and replay rather than dumping the user on
-        // an error screen. attemptReconnect falls back to the error screen once
-        // retries are exhausted or there is nothing captured to resume.
-        onConnectionLost: (state) => {
-          if (!wantCallRef.current) return; // already torn down by a deliberate hang-up
-          void attemptReconnect(state);
-        },
-      },
+      legacySession,
+      callbacks,
       opts.replayTurns,
     );
     callRef.current = call;
     await call.start();
-    log(`${voiceSession.provider} realtime call started (${voiceSession.transport})`);
+    log(`${legacySession.provider} realtime call started (${legacySession.transport})`);
   }
 
   // Records a spoken turn (user or assistant — the transcript the model itself
@@ -496,7 +631,9 @@ export default function App() {
       persistenceStateRef.current.flushedTurnCount,
     );
     setResumeAvailable(true);
-    scheduleTranscriptFlush();
+    // Native GPT-Live Talk persists finalized transcripts server-side. The
+    // legacy path still needs this plugin's chat.inject persistence bridge.
+    if (!isGptLiveCall()) scheduleTranscriptFlush();
   }
 
   // Debounced rolling persistence: flush the not-yet-flushed turns into the
@@ -583,6 +720,10 @@ export default function App() {
       // speech into transcriptRef before reporting the loss). The gateway WS is
       // separate from the WebRTC leg, so it is often still alive here; bounded
       // inside flushTranscriptToSession so the error screen isn't held up.
+      wantCallRef.current = false;
+      const failedCall = callRef.current;
+      failedCall?.stop();
+      await failedCall?.closeLogicalSession?.();
       await flushTranscriptToSession(gatewayRef.current);
       teardownCall();
       raiseFatalError("Connection lost", describeConnectionLoss(state));
@@ -590,7 +731,14 @@ export default function App() {
     }
     reconnectAttemptsRef.current += 1;
     const attempt = reconnectAttemptsRef.current;
-    teardownCall();
+    if (isGptLiveCall() && gatewayRef.current?.connected) {
+      callRef.current?.stop();
+      callRef.current = null;
+      setStreams([]);
+      setMuted(false);
+    } else {
+      teardownCall();
+    }
     setStatus("connecting");
     setDetail(`Reconnecting (${attempt}/${MAX_RECONNECT_ATTEMPTS})…`);
     log(`Connection ${state}; reconnecting (attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS})`);
@@ -602,6 +750,7 @@ export default function App() {
       await establishCall({
         replayTurns: [...turns],
         sessionKeyOverride: sessionKeyRef.current || undefined,
+        reconnect: true,
       });
     } catch (error) {
       // The rebuild failed before a live call existed, so no connection-lost
@@ -631,10 +780,11 @@ export default function App() {
 
   async function stopCall() {
     const gateway = gatewayRef.current;
+    const call = callRef.current;
     wantCallRef.current = false;
     callSounds.ended();
     // Stop audio/mic and settle the UI right away so hang-up feels instant...
-    callRef.current?.stop();
+    call?.stop();
     callRef.current = null;
     setStreams([]);
     setMuted(false);
@@ -643,7 +793,9 @@ export default function App() {
     // ...but keep the socket open just long enough to hand this call's transcript
     // to the gateway for the memory flush, then drop it. Bounded inside
     // flushTranscriptToSession so a slow gateway can't stall the disconnect.
+    await call?.closeLogicalSession?.();
     await flushTranscriptToSession(gateway);
+    voiceSessionIdRef.current = null;
     gateway?.disconnect();
     if (gatewayRef.current === gateway) gatewayRef.current = null;
     log("Call ended");
@@ -663,6 +815,19 @@ export default function App() {
     const sessionKey = sessionKeyRef.current;
     const turns = transcriptRef.current;
     if (!gateway || !sessionKey || turns.length === 0) return;
+    if (isGptLiveCall()) {
+      // OpenClaw has already appended each finalized utterance. Preserve the
+      // optional end-of-call memory turn without duplicating the transcript.
+      if (RECORD_MEMORIES) {
+        await Promise.race([
+          persistWithMemoryTurn(gateway, sessionKey, "", true).catch((error) =>
+            log(`Memory persist failed: ${String(error)}`),
+          ),
+          delay(1500),
+        ]);
+      }
+      return;
+    }
     const state = persistenceStateRef.current;
     // chat.inject appends the transcript to the session with NO agent turn (no
     // reply, no wasted tokens). chat.send is used only when memory recording is
@@ -698,6 +863,15 @@ export default function App() {
       request.catch((error) => log(`Transcript persist failed: ${String(error)}`)),
       delay(1500),
     ]);
+  }
+
+  function selectEngine(next: VoiceEngine) {
+    setEngine(next);
+    try {
+      localStorage.setItem(ENGINE_STORAGE_KEY, next);
+    } catch {
+      // Storage blocked; the choice still applies to this page session.
+    }
   }
 
   function toggleMute() {
@@ -902,6 +1076,20 @@ export default function App() {
               Call {APP_NAME}
             </button>
           )}
+          {!active && !isError && VOICE_ENGINES.available.length > 1 && (
+            <fieldset className="engineSwitch" aria-label="Voice engine">
+              {VOICE_ENGINES.available.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  aria-pressed={engine === option}
+                  onClick={() => selectEngine(option)}
+                >
+                  {ENGINE_LABELS[option]}
+                </button>
+              ))}
+            </fieldset>
+          )}
         </div>
       </section>
 
@@ -1031,11 +1219,83 @@ async function createVoiceSessionWithRetry(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+async function createGptLiveSessionWithRetry(
+  gateway: GatewayClient,
+  sessionKey: string,
+  voiceSessionId: string | undefined,
+  onRetry: (attempt: number) => void,
+): Promise<GptLiveBrowserSession> {
+  const model = VOICE_ENGINES.gptLiveModel;
+  const result = await requestVoiceSessionWithRetry(
+    gateway,
+    "talk.client.create",
+    {
+      sessionKey,
+      ...(voiceSessionId ? { voiceSessionId } : {}),
+      provider: "openai",
+      // Omitted model: OpenClaw picks gpt-live-1 with a Platform key, or
+      // gpt-live-1-codex with only a ChatGPT login.
+      ...(model ? { model } : {}),
+      ...(VOICE_ENGINES.gptLiveVoice ? { voice: VOICE_ENGINES.gptLiveVoice } : {}),
+      mode: "realtime",
+      transport: "webrtc",
+      brain: "agent-consult",
+      capabilities: ["gateway-control-v1"],
+    },
+    onRetry,
+  );
+  if (
+    !isRecord(result) ||
+    result.provider !== "openai" ||
+    result.transport !== "webrtc" ||
+    typeof result.voiceSessionId !== "string" ||
+    typeof result.clientSecret !== "string" ||
+    !isRecord(result.clientControl) ||
+    result.clientControl.owner !== "gateway"
+  ) {
+    throw new Error(
+      "OpenClaw did not return a Gateway-controlled GPT-Live WebRTC session; upgrade to OpenClaw 2026.9.4 or newer",
+    );
+  }
+  // OpenClaw 2026.9.4 omits the model from this response; 2026.10 returns it.
+  const resolvedModel = typeof result.model === "string" ? result.model : model;
+  if (!resolvedModel?.startsWith("gpt-live-") || (model && resolvedModel !== model)) {
+    throw new Error(`OpenClaw returned unsupported GPT-Live model: ${String(result.model)}`);
+  }
+  return { ...result, model: resolvedModel } as unknown as GptLiveBrowserSession;
+}
+
+async function requestVoiceSessionWithRetry(
+  gateway: GatewayClient,
+  method: string,
+  params: Record<string, unknown>,
+  onRetry: (attempt: number) => void,
+) {
+  const attempts = 3;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      // oxlint-disable-next-line react-doctor/async-await-in-loop
+      return await gateway.request(method, params, 60000);
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts || !isTransientVoiceSessionError(error)) break;
+      onRetry(attempt + 1);
+      await delay(750 * attempt);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 function isTransientVoiceSessionError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return /UND_ERR_SOCKET|SocketError|other side closed|terminated|Gateway request timed out: browserVoice\.create/i.test(
+  return /UND_ERR_SOCKET|SocketError|other side closed|terminated|Gateway request timed out: (browserVoice\.create|talk\.client\.create)/i.test(
     message,
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function delay(ms: number) {

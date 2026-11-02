@@ -188,6 +188,26 @@ in). Don't make the operator decide on any of the rest; just set it.
 Restart the gateway after writing the config. Without a usable `realtime.provider`,
 `browserVoice.create` returns `UNAVAILABLE` and calls won't connect.
 
+#### Optional: GPT-Live engine
+
+On OpenClaw 2026.9.4 or newer, also offer OpenAI's full-duplex GPT-Live by
+adding a `gptLive` block next to the legacy settings above (the PWA then shows a
+Realtime / GPT-Live switch; `path` picks the default):
+
+```jsonc
+"path": "gpt-live",
+"gptLive": { "model": "gpt-live-1", "voice": "marin" }
+```
+
+Choose the model from the operator's credentials: `gpt-live-1` needs an OpenAI
+Platform key (billed $0.05/min — the `OPENAI_API_KEY` above works);
+`gpt-live-1-codex` runs on the ChatGPT OAuth profile (`openclaw models auth
+login --provider openai`) at no per-minute cost, with voices arbor, breeze, cove,
+ember, juniper, maple, sol, spruce, vale. The bundled `openai` plugin must be
+enabled. OpenClaw owns delegation, tools, context, and transcript persistence on
+this engine, so `consultPolicy`, `toolPolicy`, `agentContext`, and
+`fastContext` don't apply to it. See the README's "GPT-Live engine" section.
+
 For xAI, replace the provider/model/voice and credential block above with:
 
 ```jsonc
@@ -239,7 +259,9 @@ the mode that matches Step 2:
 
 **A. Token** — simplest, good for a single operator / dev use. Keep
 `gateway.auth.mode: "token"`, then open the app's **Settings** once and paste the
-gateway token.
+gateway token. On OpenClaw 2026.10+ each browser pairs once: the first call
+shows `openclaw devices approve <requestId>` — run it on the gateway host, then
+call again.
 
 **B. Cloudflare Access (recommended if they chose Cloudflare)** — no token
 anywhere. Put a Cloudflare Access policy on the hostname and run the gateway in
@@ -249,12 +271,12 @@ trusted-proxy mode:
 "gateway": {
   "auth": {
     "mode": "trusted-proxy",
-    "trustedProxy": { "userHeader": "cf-access-authenticated-user-email", "allowLoopback": true }
+    "trustedProxy": { "userHeader": "cf-access-authenticated-user-email", "allowLoopback": true },
+    "identityScopes": { "<access email>": ["operator.admin"] }
   },
   "trustedProxies": ["127.0.0.1", "::1", "::ffff:127.0.0.1"],
   "controlUi": {
-    "allowedOrigins": ["https://<host>"],
-    "dangerouslyDisableDeviceAuth": true
+    "allowedOrigins": ["https://<host>"]
   }
 }
 ```
@@ -263,9 +285,12 @@ trusted-proxy mode:
   shared token are **mutually exclusive** (the gateway won't start with both).
 - `controlUi.allowedOrigins` **must** include the page origin (`https://<host>`),
   or the gateway rejects the WebSocket with "Browser origin not allowed".
-- `dangerouslyDisableDeviceAuth` is required here and is safe **only** because
-  Cloudflare Access is the sole gate — never expose the gateway without Access in
-  front. See the README's Authentication section for the full rationale.
+- Add **every** Access email that will use the app to `identityScopes` (ask the
+  operator for them) — without a grant the connection has no scopes and calls
+  fail with "missing scope". `controlUi.dangerouslyDisableDeviceAuth` is retired
+  on 2026.10+ and no longer does this. This is safe **only** because Cloudflare
+  Access is the sole gate — never expose the gateway without Access in front.
+  See the README's Authentication section for the full rationale.
 
 ---
 

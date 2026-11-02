@@ -2,7 +2,7 @@
   "id": "sureclaw-voice",
   "name": "SureClaw Voice",
   "description": "Serves the browser voice web app and mints OpenAI or xAI browser realtime sessions from the configured realtime voice config.",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "activation": {
     "onStartup": true
   },
@@ -33,7 +33,27 @@
           "name": { "type": "string", "description": "Display name shown in the page title, manifest, and the Call button. Default: OpenClaw." }
         }
       },
-      "realtime": { "type": "object", "additionalProperties": true }
+      "realtime": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "path": {
+            "type": "string",
+            "enum": ["legacy", "gpt-live"],
+            "description": "Default voice engine. Omit or use legacy for existing OpenAI Realtime/xAI behavior; gpt-live uses native OpenClaw Talk with an OpenAI gpt-live-* model."
+          },
+          "gptLive": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Offers the GPT-Live engine alongside the legacy one (the PWA shows a Realtime / GPT-Live switch). Requires OpenClaw 2026.9.4 or newer.",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "model": { "type": "string", "description": "gpt-live-1 (OpenAI Platform key) or gpt-live-1-codex (ChatGPT OAuth). Omit to let OpenClaw choose from the available credentials." },
+              "voice": { "type": "string", "description": "GPT-Live voice. Unknown voices fall back to the model default (marin / cove)." }
+            }
+          }
+        }
+      }
     }
   }
 }

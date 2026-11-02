@@ -37,6 +37,9 @@ The plugin id is `sureclaw-voice`, so it lives at
 
 ### Plugin config
 
+`realtime.path` selects the implementation. It defaults to `"legacy"`, so
+existing OpenAI Realtime and xAI installations keep their current behavior.
+
 A complete, current config (`plugins.entries.sureclaw-voice` in `openclaw.json`).
 Everything is optional except a usable `realtime.provider` — without one,
 `browserVoice.create` returns `UNAVAILABLE`.
@@ -48,6 +51,7 @@ Everything is optional except a usable `realtime.provider` — without one,
       "enabled": true,
       "config": {
         "realtime": {
+          "path": "legacy",              // default when omitted
           "enabled": true,
           "provider": "openai",          // a registered realtime voice provider
           "model": "gpt-realtime-2.1",     // required — no provider default
@@ -102,6 +106,61 @@ Everything is optional except a usable `realtime.provider` — without one,
   }
 }
 ```
+
+### GPT-Live engine
+
+OpenClaw 2026.9.4+ can run OpenAI's full-duplex
+[GPT-Live](https://developers.openai.com/api/docs/models/gpt-live-1) through
+native Talk. The browser only does microphone/speaker WebRTC (SDP brokered by
+the gateway at `/plugins/openai/realtime/calls`); OpenClaw owns the GPT-Live
+control channel, delegates work to the real agent (tools, memory, the same
+session), and persists the transcript itself.
+
+Add a `gptLive` block to offer it **alongside** the legacy engine — the PWA then
+shows a **Realtime / GPT-Live** switch under the Call button, remembered per
+browser; `path` picks the default:
+
+```jsonc
+"realtime": {
+  "enabled": true,
+  "provider": "openai",
+  "model": "gpt-realtime-2.1",     // legacy engine (unchanged)
+  "voice": "marin",
+  "path": "gpt-live",              // default engine: "legacy" (default) | "gpt-live"
+  "gptLive": {
+    "model": "gpt-live-1",         // or "gpt-live-1-codex"; omit to let OpenClaw choose
+    "voice": "marin"
+  }
+}
+```
+
+For a GPT-Live-only deployment, set `"path": "gpt-live"` with a `gpt-live-*`
+top-level `model`/`voice` and no `gptLive` block.
+
+| Model | Auth | Billing | Voices (OpenClaw 2026.10) |
+| --- | --- | --- | --- |
+| `gpt-live-1` | OpenAI Platform key (`OPENAI_API_KEY` / `openai` api-key profile) | $0.05/min + agent model | alloy, ash, ballad, cedar, coral, echo, marin (default), sage, shimmer, verse, quartz & ripple (Australian), vesper, willow, stone, gleam, meridian, bossa, tempo, beacon, delta, cinder |
+| `gpt-live-1-codex` | ChatGPT OAuth (`openclaw models auth login --provider openai`), Platform key fallback | ChatGPT subscription | arbor, breeze, cove (default), ember, juniper, maple, sol, spruce, vale |
+
+Behaviour worth knowing:
+
+- **Full duplex.** The mic streams continuously and the model decides when to
+  speak, yield, or backchannel ("mhm"). The PWA runs no local VAD and never ducks
+  playback — interruptions and overlap are the model's job.
+- **Delegation.** GPT-Live hands substantive requests to the OpenClaw agent
+  (`talk-realtime-consult-*` runs on the call's session) and keeps talking while
+  it works; the PWA shows "Working on it… / Running <tool>…" and the pending cue
+  fills any silence. High-impact tool calls wait for a spoken "yes".
+- **Voices.** A voice the host doesn't list for the model silently becomes the
+  model default; the PWA logs the substitution. The newer voices (OpenAI's
+  2026-10-16 additions, Codex v3 voices such as `himari`) need a newer OpenClaw.
+- **Limits.** OpenClaw caps a GPT-Live session at 30 minutes; the PWA reconnects
+  with the same voice session id so the agent session and accepted work carry on.
+- **Not used by GPT-Live:** `consultPolicy`, `toolPolicy`, `agentContext`,
+  `fastContext`, `instructions` — native Talk uses `talk.realtime.*`
+  (`instructions`, `consultThinkingLevel`, …) and the agent's own context.
+- Don't set a custom OpenAI `baseUrl` for Talk — OpenClaw then falls back to
+  `gpt-realtime-2.1`.
 
 ### xAI Grok Voice alternative
 
@@ -181,28 +240,40 @@ ignored for xAI's direct WebSocket transport.
 ## Authentication
 
 The plugin serves only the static page (no credential is embedded). The gateway
-authenticates the WebSocket. Two supported deployments:
+authenticates the WebSocket.
+
+On OpenClaw 2026.10+ a browser UI client needs either a **paired device
+identity** or a **trusted-proxy identity grant** to keep any operator scopes —
+`controlUi.dangerouslyDisableDeviceAuth` is retired and ignored. The PWA signs
+its connect with a per-browser Ed25519 key (non-extractable, in IndexedDB),
+exactly like the bundled Control UI, except behind a trusted proxy where the
+proxy identity is the credential.
 
 ### A. Token (simple / single operator)
 
 Keep `gateway.auth.mode: "token"`. Open the app's Settings once and paste the
-gateway token. Fine for personal/dev use.
+gateway token. The first call from each browser fails with
+`pairing required — approve this device on the gateway host with: openclaw devices approve <requestId>`;
+approve it once (`openclaw devices list` shows pending requests) and call again.
 
 ### B. Cloudflare Access (recommended for customers — no token anywhere)
 
 Put a Cloudflare Access policy on the hostname and run the gateway in
-trusted-proxy mode so it trusts the Access-authenticated identity:
+trusted-proxy mode so it trusts the Access-authenticated identity, granting
+scopes per Access email:
 
 ```jsonc
 "gateway": {
   "auth": {
     "mode": "trusted-proxy",
-    "trustedProxy": { "userHeader": "cf-access-authenticated-user-email", "allowLoopback": true }
+    "trustedProxy": { "userHeader": "cf-access-authenticated-user-email", "allowLoopback": true },
+    "identityScopes": {
+      "owner@example.com": ["operator.admin"]
+    }
   },
   "trustedProxies": ["127.0.0.1", "::1", "::ffff:127.0.0.1"],
   "controlUi": {
-    "allowedOrigins": ["https://<host>"],
-    "dangerouslyDisableDeviceAuth": true
+    "allowedOrigins": ["https://<host>"]
   }
 }
 ```
@@ -213,10 +284,13 @@ Notes:
 - `trustedProxies` must include the loopback address cloudflared connects from.
 - `controlUi.allowedOrigins` must include the page origin, or the gateway rejects
   the WebSocket with "Browser origin not allowed".
-- `dangerouslyDisableDeviceAuth` is **required** here: trusted-proxy establishes
-  identity, but operator **scopes** otherwise only bind to a paired device, so
-  without it every method fails with "missing scope". It is safe **only** because
-  Cloudflare Access is the sole gate and there is no token to steal — never
+- `identityScopes` is **required**: without a grant the connection keeps no
+  scopes and every method fails with "missing scope". Keys match the Access email
+  case-insensitively. `operator.admin` gives owner-level agent consults and the
+  legacy transcript bridge (`chat.inject`); `["operator.write"]` is enough for
+  non-owner consults, and `["operator.talk"]` limits GPT-Live delegation to
+  safe read-only tools.
+- This is safe **only** because Cloudflare Access is the sole gate — never
   expose the gateway without Access in front. The gateway binds to loopback and
   is reachable only through cloudflared, and Cloudflare strips client-supplied
   `Cf-Access-*` headers, so a bypass cannot forge identity.

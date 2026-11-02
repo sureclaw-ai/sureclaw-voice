@@ -32,6 +32,18 @@ type RealtimeBrowserSessionBase = {
   expiresAt?: number;
 };
 
+export type GptLiveBrowserSession = RealtimeBrowserSessionBase & {
+  provider: "openai";
+  transport: "webrtc";
+  voiceSessionId: string;
+  clientSecret: string;
+  offerUrl?: string;
+  offerHeaders?: Record<string, string>;
+  offerResponseMaxBytes?: number;
+  iceServers?: RTCIceServer[];
+  clientControl: { owner: "gateway" };
+};
+
 export type RealtimeBrowserSession =
   | (RealtimeBrowserSessionBase & {
       transport: "webrtc";

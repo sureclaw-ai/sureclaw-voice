@@ -1,4 +1,13 @@
 import type { GatewayAuthMode, GatewayEvent, GatewayResponse } from "../types";
+import { buildDeviceAuth } from "./deviceIdentity";
+
+const CLIENT_ID = "openclaw-control-ui";
+const CLIENT_MODE = "ui";
+const ROLE = "operator";
+// operator.admin keeps owner-level agent consults and chat.inject (the legacy
+// transcript bridge); operator.talk covers native GPT-Live Talk. The gateway
+// still caps these to whatever the device pairing / identity grant allows.
+const SCOPES = ["operator.admin", "operator.read", "operator.write", "operator.talk"];
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -16,6 +25,9 @@ export class GatewayClient {
     private readonly url: string,
     private readonly authMode: GatewayAuthMode,
     private readonly secret: string,
+    // Behind a trusted proxy (Cloudflare Access) the proxy identity is the
+    // credential, and an unpaired device would only trigger a pairing prompt.
+    private readonly useDeviceIdentity = true,
   ) {}
 
   connect(): Promise<unknown> {
@@ -52,10 +64,9 @@ export class GatewayClient {
 
         if (frame.type === "event") {
           if (frame.event === "connect.challenge") {
-            this.request("connect", this.buildConnectParams(frame.payload), 15000).then(
-              settleResolve,
-              settleReject,
-            );
+            this.buildConnectParams(frame.payload)
+              .then((params) => this.request("connect", params, 15000))
+              .then(settleResolve, settleReject);
             return;
           }
           this.listeners.forEach((listener) => listener(frame));
@@ -68,10 +79,7 @@ export class GatewayClient {
           window.clearTimeout(pending.timeout);
           this.pending.delete(frame.id);
           if (frame.ok) pending.resolve(frame.payload);
-          else
-            pending.reject(
-              new Error(frame.error?.message || frame.error?.code || "Gateway request failed"),
-            );
+          else pending.reject(describeGatewayError(frame.error));
         }
       });
 
@@ -121,21 +129,41 @@ export class GatewayClient {
     return promise;
   }
 
-  private buildConnectParams(_challengePayload: unknown) {
+  private async buildConnectParams(challengePayload: unknown) {
+    const challenge = (challengePayload ?? {}) as { nonce?: unknown; ts?: unknown };
+    const nonce = typeof challenge.nonce === "string" ? challenge.nonce : "";
+    const signedAt = typeof challenge.ts === "number" ? challenge.ts : Date.now();
+    const token = this.authMode === "password" ? "" : this.secret;
+    const device = this.useDeviceIdentity
+      ? await buildDeviceAuth({
+          clientId: CLIENT_ID,
+          clientMode: CLIENT_MODE,
+          role: ROLE,
+          scopes: SCOPES,
+          token,
+          nonce,
+          signedAt,
+        })
+      : null;
     return {
       minProtocol: 4,
       maxProtocol: 4,
       client: {
-        id: "openclaw-control-ui",
+        id: CLIENT_ID,
         displayName: "OpenClaw Voice PWA",
         version: __PLUGIN_VERSION__,
+        // This plugin UI is versioned independently from OpenClaw's bundled
+        // Control UI. Current gateways explicitly accept "dev" here rather
+        // than applying the bundled UI's exact-build reload guard.
+        buildId: "dev",
         platform: "web",
-        mode: "ui",
+        mode: CLIENT_MODE,
       },
       caps: ["tool-events"],
       auth: this.authMode === "password" ? { password: this.secret } : { token: this.secret },
-      role: "operator",
-      scopes: ["operator.admin"],
+      role: ROLE,
+      scopes: SCOPES,
+      ...(device ? { device } : {}),
     };
   }
 
@@ -146,4 +174,17 @@ export class GatewayClient {
     });
     this.pending.clear();
   }
+}
+
+// Turns a gateway error frame into an Error, adding the approval command when
+// the gateway is waiting for this browser's first device pairing.
+function describeGatewayError(error: GatewayResponse["error"]) {
+  const message = error?.message || error?.code || "Gateway request failed";
+  const details = (error?.details ?? {}) as { requestId?: unknown };
+  if (error?.code === "NOT_PAIRED" && typeof details.requestId === "string") {
+    return new Error(
+      `${message} — approve this device on the gateway host with: openclaw devices approve ${details.requestId}`,
+    );
+  }
+  return new Error(message);
 }
