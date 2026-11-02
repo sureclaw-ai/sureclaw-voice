@@ -385,8 +385,8 @@ const WEBAPP_CONTENT_TYPES = {
 const TOKENIZED_EXTENSIONS = /* @__PURE__ */ new Set([".html", ".webmanifest"]);
 function registerWebappRoute(api) {
 	const webapp = api.pluginConfig?.webapp;
-	const engines = resolveVoiceEngines(api.pluginConfig?.realtime);
-	if (engines.gptLive) api.logger?.info?.(`sureclaw-voice: GPT-Live engine ${engines.gptLive.model || "(OpenClaw default model)"}${engines.gptLive.voice ? ` voice=${engines.gptLive.voice}` : ""}; default engine ${engines.defaultEngine}`);
+	const voiceEngine = resolveVoiceEngine(api.pluginConfig?.realtime);
+	if (voiceEngine.gptLive) api.logger?.info?.(`sureclaw-voice: GPT-Live engine ${voiceEngine.gptLive.model || "(OpenClaw default model)"}${voiceEngine.gptLive.voice ? ` voice=${voiceEngine.gptLive.voice}` : ""}`);
 	const dir = resolveWebappDir();
 	if (!dir) {
 		api.logger?.warn?.("sureclaw-voice: voice web app not served — no built assets found. Build the PWA and stage it into the plugin's webapp/ directory (npm run build).");
@@ -404,10 +404,9 @@ function registerWebappRoute(api) {
 		__APP_SHORT_NAME__: homeScreenLabel,
 		__APP_GATEWAY_AUTH__: gatewayAuthMode,
 		__APP_RECORD_MEMORIES__: String(recordMemories),
-		__APP_VOICE_ENGINES__: [engines.legacy ? "legacy" : "", engines.gptLive ? "gpt-live" : ""].filter(Boolean).join(","),
-		__APP_DEFAULT_ENGINE__: engines.defaultEngine,
-		__APP_GPT_LIVE_MODEL__: engines.gptLive?.model ?? "",
-		__APP_GPT_LIVE_VOICE__: engines.gptLive?.voice ?? ""
+		__APP_VOICE_ENGINE__: voiceEngine.engine,
+		__APP_GPT_LIVE_MODEL__: voiceEngine.gptLive?.model ?? "",
+		__APP_GPT_LIVE_VOICE__: voiceEngine.gptLive?.voice ?? ""
 	};
 	const mount = normalizeWebappMount(webapp?.path ?? DEFAULT_WEBAPP_MOUNT);
 	api.registerHttpRoute({
@@ -418,7 +417,7 @@ function registerWebappRoute(api) {
 	});
 	api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
 }
-function resolveVoiceEngines(realtime) {
+function resolveVoiceEngine(realtime) {
 	const topLevelIsGptLive = isGptLiveModel(realtime?.model);
 	let gptLive;
 	if (realtime?.gptLive && realtime.gptLive.enabled !== false) gptLive = {
@@ -430,11 +429,10 @@ function resolveVoiceEngines(realtime) {
 		voice: realtime.voice?.trim() ?? ""
 	};
 	if (gptLive?.model && !isGptLiveModel(gptLive.model)) gptLive = void 0;
-	const legacy = Boolean(realtime?.provider && realtime.model && !topLevelIsGptLive);
+	if (!gptLive || realtime?.path !== "gpt-live") return { engine: "legacy" };
 	return {
-		defaultEngine: gptLive && (realtime?.path === "gpt-live" || !legacy) ? "gpt-live" : "legacy",
-		legacy,
-		...gptLive ? { gptLive } : {}
+		engine: "gpt-live",
+		gptLive
 	};
 }
 function isGptLiveModel(model) {

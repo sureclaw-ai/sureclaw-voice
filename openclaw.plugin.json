@@ -45,7 +45,7 @@
           "gptLive": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Offers the GPT-Live engine alongside the legacy one (the PWA shows a Realtime / GPT-Live switch). Requires OpenClaw 2026.9.4 or newer.",
+            "description": "GPT-Live engine settings, used when path is gpt-live (the legacy provider/model/voice can stay configured). Requires OpenClaw 2026.9.4 or newer.",
             "properties": {
               "enabled": { "type": "boolean" },
               "model": { "type": "string", "description": "gpt-live-1 (OpenAI Platform key) or gpt-live-1-codex (ChatGPT OAuth). Omit to let OpenClaw choose from the available credentials." },

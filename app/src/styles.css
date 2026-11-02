@@ -283,34 +283,6 @@ select {
   color: var(--text);
 }
 
-/* Realtime / GPT-Live engine switch, shown only when both are configured. */
-.engineSwitch {
-  display: inline-flex;
-  margin: 0;
-  min-width: 0;
-  padding: 3px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--bg-2);
-}
-
-.engineSwitch button {
-  border: 0;
-  border-radius: 999px;
-  padding: 6px 14px;
-  background: none;
-  color: var(--muted);
-  font: inherit;
-  font-size: 0.85rem;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.engineSwitch button[aria-pressed="true"] {
-  background: var(--panel);
-  color: var(--text);
-}
-
 /* ---------- Settings sheet ---------- */
 
 .sheetBackdrop {

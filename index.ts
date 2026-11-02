@@ -28,13 +28,13 @@ type BrowserVoiceParams = {
 
 type RealtimeVoiceConfig = {
   enabled?: boolean;
-  // Default voice engine. Omitted/"legacy" preserves the plugin's existing
+  // Voice engine. Omitted/"legacy" preserves the plugin's existing
   // browser-owned OpenAI Realtime and xAI paths. "gpt-live" delegates the
   // control channel, tools, and transcript lifecycle to native OpenClaw Talk
   // and is restricted to OpenAI gpt-live-* models.
   path?: "legacy" | "gpt-live";
-  // GPT-Live engine settings. When present, GPT-Live is offered alongside the
-  // legacy engine (provider/model/voice above) and the PWA shows a switch.
+  // GPT-Live engine settings, used when `path` is "gpt-live", so the legacy
+  // provider/model/voice above can stay configured for switching back.
   // Without it, `path: "gpt-live"` reads the top-level model/voice instead.
   gptLive?: GptLiveConfig;
   provider?: string;
@@ -66,9 +66,8 @@ type GptLiveConfig = {
   voice?: string;
 };
 
-type VoiceEngines = {
-  defaultEngine: "legacy" | "gpt-live";
-  legacy: boolean;
+type VoiceEngine = {
+  engine: "legacy" | "gpt-live";
   gptLive?: { model: string; voice: string };
 };
 
@@ -663,11 +662,11 @@ function registerWebappRoute(api: {
   }) => void;
 }) {
   const webapp = api.pluginConfig?.webapp;
-  const engines = resolveVoiceEngines(api.pluginConfig?.realtime);
-  if (engines.gptLive) {
+  const voiceEngine = resolveVoiceEngine(api.pluginConfig?.realtime);
+  if (voiceEngine.gptLive) {
     api.logger?.info?.(
-      `sureclaw-voice: GPT-Live engine ${engines.gptLive.model || "(OpenClaw default model)"}` +
-        `${engines.gptLive.voice ? ` voice=${engines.gptLive.voice}` : ""}; default engine ${engines.defaultEngine}`,
+      `sureclaw-voice: GPT-Live engine ${voiceEngine.gptLive.model || "(OpenClaw default model)"}` +
+        `${voiceEngine.gptLive.voice ? ` voice=${voiceEngine.gptLive.voice}` : ""}`,
     );
   }
 
@@ -705,12 +704,9 @@ function registerWebappRoute(api: {
     __APP_SHORT_NAME__: homeScreenLabel,
     __APP_GATEWAY_AUTH__: gatewayAuthMode,
     __APP_RECORD_MEMORIES__: String(recordMemories),
-    __APP_VOICE_ENGINES__: [engines.legacy ? "legacy" : "", engines.gptLive ? "gpt-live" : ""]
-      .filter(Boolean)
-      .join(","),
-    __APP_DEFAULT_ENGINE__: engines.defaultEngine,
-    __APP_GPT_LIVE_MODEL__: engines.gptLive?.model ?? "",
-    __APP_GPT_LIVE_VOICE__: engines.gptLive?.voice ?? "",
+    __APP_VOICE_ENGINE__: voiceEngine.engine,
+    __APP_GPT_LIVE_MODEL__: voiceEngine.gptLive?.model ?? "",
+    __APP_GPT_LIVE_VOICE__: voiceEngine.gptLive?.voice ?? "",
   };
 
   // Serve-only: the gateway authenticates the WebSocket itself (token or
@@ -725,22 +721,20 @@ function registerWebappRoute(api: {
   api.logger?.info?.(`sureclaw-voice: serving voice web app at ${mount}/`);
 }
 
-// Works out which voice engines the PWA may offer. The legacy engine is the
-// plugin's own realtime provider/model; GPT-Live is either the `gptLive` block
-// or, for GPT-Live-only configs, `path: "gpt-live"` with a gpt-live-* model.
-function resolveVoiceEngines(realtime: RealtimeVoiceConfig | undefined): VoiceEngines {
+// Works out which voice engine the PWA runs (realtime.path). The legacy engine
+// is the plugin's own realtime provider/model; GPT-Live is either the `gptLive`
+// block or, for GPT-Live-only configs, a gpt-live-* top-level model.
+function resolveVoiceEngine(realtime: RealtimeVoiceConfig | undefined): VoiceEngine {
   const topLevelIsGptLive = isGptLiveModel(realtime?.model);
-  let gptLive: VoiceEngines["gptLive"];
+  let gptLive: VoiceEngine["gptLive"];
   if (realtime?.gptLive && realtime.gptLive.enabled !== false) {
     gptLive = { model: realtime.gptLive.model?.trim() ?? "", voice: realtime.gptLive.voice?.trim() ?? "" };
   } else if (realtime?.path === "gpt-live" && (topLevelIsGptLive || !realtime.model)) {
     gptLive = { model: realtime.model?.trim() ?? "", voice: realtime.voice?.trim() ?? "" };
   }
   if (gptLive?.model && !isGptLiveModel(gptLive.model)) gptLive = undefined;
-  const legacy = Boolean(realtime?.provider && realtime.model && !topLevelIsGptLive);
-  const defaultEngine =
-    gptLive && (realtime?.path === "gpt-live" || !legacy) ? "gpt-live" : "legacy";
-  return { defaultEngine, legacy, ...(gptLive ? { gptLive } : {}) };
+  if (!gptLive || realtime?.path !== "gpt-live") return { engine: "legacy" };
+  return { engine: "gpt-live", gptLive };
 }
 
 function isGptLiveModel(model: string | undefined) {

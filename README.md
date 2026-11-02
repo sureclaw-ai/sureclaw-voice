@@ -116,9 +116,8 @@ the gateway at `/plugins/openai/realtime/calls`); OpenClaw owns the GPT-Live
 control channel, delegates work to the real agent (tools, memory, the same
 session), and persists the transcript itself.
 
-Add a `gptLive` block to offer it **alongside** the legacy engine — the PWA then
-shows a **Realtime / GPT-Live** switch under the Call button, remembered per
-browser; `path` picks the default:
+Select it with `path` and a `gptLive` block; the legacy settings can stay in
+place so switching back is a one-line `path` change:
 
 ```jsonc
 "realtime": {
@@ -126,7 +125,7 @@ browser; `path` picks the default:
   "provider": "openai",
   "model": "gpt-realtime-2.1",     // legacy engine (unchanged)
   "voice": "marin",
-  "path": "gpt-live",              // default engine: "legacy" (default) | "gpt-live"
+  "path": "gpt-live",              // engine: "legacy" (default) | "gpt-live"
   "gptLive": {
     "model": "gpt-live-1",         // or "gpt-live-1-codex"; omit to let OpenClaw choose
     "voice": "marin"

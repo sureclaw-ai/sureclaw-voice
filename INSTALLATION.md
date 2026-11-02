@@ -190,9 +190,9 @@ Restart the gateway after writing the config. Without a usable `realtime.provide
 
 #### Optional: GPT-Live engine
 
-On OpenClaw 2026.9.4 or newer, also offer OpenAI's full-duplex GPT-Live by
-adding a `gptLive` block next to the legacy settings above (the PWA then shows a
-Realtime / GPT-Live switch; `path` picks the default):
+On OpenClaw 2026.9.4 or newer, switch to OpenAI's full-duplex GPT-Live by
+adding `path` and a `gptLive` block next to the legacy settings above (set
+`path` back to `"legacy"` to return to them):
 
 ```jsonc
 "path": "gpt-live",

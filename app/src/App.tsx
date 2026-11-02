@@ -96,55 +96,25 @@ function readRecordMemories(): boolean {
 
 const RECORD_MEMORIES = readRecordMemories();
 
-type VoiceEngine = "legacy" | "gpt-live";
+type GptLiveConfig = { model?: string; voice?: string };
 
-type VoiceEngineConfig = {
-  available: VoiceEngine[];
-  defaultEngine: VoiceEngine;
-  gptLiveModel?: string;
-  gptLiveVoice?: string;
-};
-
-// Reads the engines the plugin offers from the meta tags it rewrites at serve
-// time. The raw Vite dev server leaves the placeholders, which fall back to the
-// legacy engine only.
-function readVoiceEngineConfig(): VoiceEngineConfig {
+// The voice engine is chosen in the plugin config (realtime.path), which the
+// gateway writes into these meta tags at serve time. The raw Vite dev server
+// leaves the placeholders, which select the legacy engine.
+function readGptLiveConfig(): GptLiveConfig | undefined {
   const readMeta = (name: string) => {
     const value = document.querySelector(`meta[name="${name}"]`)?.getAttribute("content")?.trim();
     return value && !/^__.*__$/.test(value) ? value : "";
   };
-  const available = readMeta("x-app-voice-engines")
-    .split(",")
-    .filter((engine): engine is VoiceEngine => engine === "legacy" || engine === "gpt-live");
-  if (available.length === 0) available.push("legacy");
-  const configuredDefault = readMeta("x-app-default-engine");
+  if (readMeta("x-app-voice-engine") !== "gpt-live") return undefined;
   return {
-    available,
-    defaultEngine: available.includes(configuredDefault as VoiceEngine)
-      ? (configuredDefault as VoiceEngine)
-      : available[0],
-    gptLiveModel: readMeta("x-app-gpt-live-model") || undefined,
-    gptLiveVoice: readMeta("x-app-gpt-live-voice") || undefined,
+    model: readMeta("x-app-gpt-live-model") || undefined,
+    voice: readMeta("x-app-gpt-live-voice") || undefined,
   };
 }
 
-const VOICE_ENGINES = readVoiceEngineConfig();
-const ENGINE_STORAGE_KEY = "sureclaw-voice-engine";
-
-// The caller's last engine choice, when the deployment still offers it.
-function loadEnginePreference(): VoiceEngine {
-  try {
-    const stored = localStorage.getItem(ENGINE_STORAGE_KEY);
-    if (stored && VOICE_ENGINES.available.includes(stored as VoiceEngine)) {
-      return stored as VoiceEngine;
-    }
-  } catch {
-    // Storage blocked (private mode); use the configured default.
-  }
-  return VOICE_ENGINES.defaultEngine;
-}
-
-const ENGINE_LABELS: Record<VoiceEngine, string> = { legacy: "Realtime", "gpt-live": "GPT-Live" };
+const GPT_LIVE = readGptLiveConfig();
+const USE_GPT_LIVE = GPT_LIVE !== undefined;
 
 type ActiveVoiceCall = {
   start: () => Promise<void>;
@@ -361,11 +331,6 @@ export default function App() {
   // Native Talk reuses this logical id only while replacing a dropped WebRTC
   // transport. A user-started call resets it; reconnect deliberately retains it.
   const voiceSessionIdRef = useRef<string | null>(null);
-  // The engine picked on the idle screen, and the one the current call (and its
-  // reconnects) actually runs on — fixed when the call starts.
-  const [engine, setEngine] = useState<VoiceEngine>(loadEnginePreference);
-  const callEngineRef = useRef<VoiceEngine>(engine);
-  const isGptLiveCall = () => callEngineRef.current === "gpt-live";
   // The live transcript of the current/last call, captured turn-by-turn from the
   // realtime session and mirrored to storage. Replayed into a fresh session on
   // reconnect/resume so the model picks the conversation back up.
@@ -427,7 +392,6 @@ export default function App() {
     setShowSettings(false);
     reconnectAttemptsRef.current = 0;
     voiceSessionIdRef.current = null;
-    callEngineRef.current = engine;
     // A new call gets a fresh transcript-message header; a stale debounce from
     // the previous call must not fire into this one. (Reconnects go through
     // establishCall directly and deliberately keep both.)
@@ -480,9 +444,7 @@ export default function App() {
     sessionKeyOverride?: string;
     reconnect?: boolean;
   }) {
-    const reuseGateway = Boolean(
-      isGptLiveCall() && opts.reconnect && gatewayRef.current?.connected,
-    );
+    const reuseGateway = Boolean(USE_GPT_LIVE && opts.reconnect && gatewayRef.current?.connected);
     if (reuseGateway) {
       callRef.current?.stop();
       callRef.current = null;
@@ -493,7 +455,7 @@ export default function App() {
       // A dead Gateway connection closes its owned native Talk session. Start
       // another logical voice session; the backing agent session still carries
       // the transcript/context accumulated before the socket loss.
-      if (isGptLiveCall() && opts.reconnect) voiceSessionIdRef.current = null;
+      if (USE_GPT_LIVE && opts.reconnect) voiceSessionIdRef.current = null;
     }
     setStatus("connecting");
     setDetail("Opening gateway");
@@ -545,7 +507,7 @@ export default function App() {
     // The legacy engine mints its provider session up front; GPT-Live mints
     // inside start(), after the microphone is granted, because its offer token
     // is single-use and expires after 60 seconds.
-    const legacySession = isGptLiveCall()
+    const legacySession = USE_GPT_LIVE
       ? undefined
       : await createVoiceSessionWithRetry(gateway, { sessionKey, agentId }, onSetupRetry);
     if (legacySession) {
@@ -597,7 +559,7 @@ export default function App() {
           return session;
         },
         callbacks,
-        VOICE_ENGINES.gptLiveVoice,
+        GPT_LIVE?.voice,
       );
       callRef.current = call;
       await call.start();
@@ -633,7 +595,7 @@ export default function App() {
     setResumeAvailable(true);
     // Native GPT-Live Talk persists finalized transcripts server-side. The
     // legacy path still needs this plugin's chat.inject persistence bridge.
-    if (!isGptLiveCall()) scheduleTranscriptFlush();
+    if (!USE_GPT_LIVE) scheduleTranscriptFlush();
   }
 
   // Debounced rolling persistence: flush the not-yet-flushed turns into the
@@ -731,7 +693,7 @@ export default function App() {
     }
     reconnectAttemptsRef.current += 1;
     const attempt = reconnectAttemptsRef.current;
-    if (isGptLiveCall() && gatewayRef.current?.connected) {
+    if (USE_GPT_LIVE && gatewayRef.current?.connected) {
       callRef.current?.stop();
       callRef.current = null;
       setStreams([]);
@@ -815,7 +777,7 @@ export default function App() {
     const sessionKey = sessionKeyRef.current;
     const turns = transcriptRef.current;
     if (!gateway || !sessionKey || turns.length === 0) return;
-    if (isGptLiveCall()) {
+    if (USE_GPT_LIVE) {
       // OpenClaw has already appended each finalized utterance. Preserve the
       // optional end-of-call memory turn without duplicating the transcript.
       if (RECORD_MEMORIES) {
@@ -863,15 +825,6 @@ export default function App() {
       request.catch((error) => log(`Transcript persist failed: ${String(error)}`)),
       delay(1500),
     ]);
-  }
-
-  function selectEngine(next: VoiceEngine) {
-    setEngine(next);
-    try {
-      localStorage.setItem(ENGINE_STORAGE_KEY, next);
-    } catch {
-      // Storage blocked; the choice still applies to this page session.
-    }
   }
 
   function toggleMute() {
@@ -1076,20 +1029,6 @@ export default function App() {
               Call {APP_NAME}
             </button>
           )}
-          {!active && !isError && VOICE_ENGINES.available.length > 1 && (
-            <fieldset className="engineSwitch" aria-label="Voice engine">
-              {VOICE_ENGINES.available.map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  aria-pressed={engine === option}
-                  onClick={() => selectEngine(option)}
-                >
-                  {ENGINE_LABELS[option]}
-                </button>
-              ))}
-            </fieldset>
-          )}
         </div>
       </section>
 
@@ -1225,7 +1164,7 @@ async function createGptLiveSessionWithRetry(
   voiceSessionId: string | undefined,
   onRetry: (attempt: number) => void,
 ): Promise<GptLiveBrowserSession> {
-  const model = VOICE_ENGINES.gptLiveModel;
+  const model = GPT_LIVE?.model;
   const result = await requestVoiceSessionWithRetry(
     gateway,
     "talk.client.create",
@@ -1236,7 +1175,7 @@ async function createGptLiveSessionWithRetry(
       // Omitted model: OpenClaw picks gpt-live-1 with a Platform key, or
       // gpt-live-1-codex with only a ChatGPT login.
       ...(model ? { model } : {}),
-      ...(VOICE_ENGINES.gptLiveVoice ? { voice: VOICE_ENGINES.gptLiveVoice } : {}),
+      ...(GPT_LIVE?.voice ? { voice: GPT_LIVE?.voice } : {}),
       mode: "realtime",
       transport: "webrtc",
       brain: "agent-consult",
